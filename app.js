@@ -103,20 +103,45 @@ const S = {
   tab: "home", adminSub: "settings", forms: [], kpiMonth: THISMONTH, calMonth: THISMONTH, repMonth: THISMONTH, tplCat: "all", selDay: TODAY, moneyMonth: THISMONTH,
   onlyMine: ls.get("shin_onlymine", "0") === "1"
 };
-let memberUnsub = null, dataUnsubs = [];
+let memberUnsub = null, permsUnsub = null, dataUnsubs = [];
 const cfg = () => Object.assign({}, DEFAULTS, S.config || {});
 const uid = () => S.user && S.user.uid;
 const isActive = () => S.isAdmin || (S.member && S.member.status === "active");
-const ROLES = [["sub", "副管理者"], ["member", "メンバー"], ["viewer", "閲覧のみ"]];
-const ROLE_HELP = { sub: "KPIの設定・すべての業務の編集ができる", member: "業務の登録と、自分の担当KPIの入力ができる", viewer: "見るだけ（登録・入力はできない）" };
+const ROLES = [["sub", "副管理者"], ["member", "メンバー"], ["intern", "インターン"], ["viewer", "閲覧のみ"]];
+/* ===== 権限の表：段階ごとに、機能の「見る・追加・全員分の編集」をオン・オフする（管理 → 設定 → 権限）。
+   同じ内容を firestore.rules でも確認するので、画面で隠すだけではない ===== */
+const WS_DOMAIN = "shincareer.com";
+const isWS = e => /@shincareer\.com$/i.test(e || "");
+const PERM_DEFS = [
+  ["業務カレンダー", [["cal_view", "見る"], ["cal_add", "登録する（自分が登録した分の編集・担当分の完了）"], ["cal_editAll", "全員の業務を編集・削除"]]],
+  ["未対応事項", [["issue_add", "追加する（自分の分の編集・担当分の完了）"], ["issue_editAll", "全員の分を編集・削除"]]],
+  ["KPI", [["kpi_input", "担当のKPIに進捗を入力"], ["kpi_viewAll", "公開範囲に関係なく、すべてのKPIを見る"], ["kpi_manage", "KPIの作成・編集・削除"]]],
+  ["フォーム", [["forms_view", "見る"], ["forms_manage", "追加・編集"]]],
+  ["テンプレ一覧", [["tpl_view", "見る"], ["tpl_add", "追加する（自分の分の編集）"], ["tpl_editAll", "全員の分を編集・削除"]]],
+  ["議事録", [["min_view", "見る"], ["min_add", "追加する（自分の分の編集）"], ["min_editAll", "全員の分を編集・削除"]]],
+  ["収支", [["fin_add", "記録を追加（自分が追加した記録だけ見られる）"], ["fin_view", "すべての記録と集計を見る（shincareer.com のアカウントのみ）"], ["fin_edit", "すべての記録を編集・削除（shincareer.com のアカウントのみ）"]]]
+];
+const PERM_KEYS = PERM_DEFS.flatMap(([, a]) => a.map(([k]) => k));
+// オンにすると、前提になる項目も自動でオンにする（例：全員分の編集 → 登録 → 見る）
+const PERM_DEPS = { cal_add: ["cal_view"], cal_editAll: ["cal_add"], issue_editAll: ["issue_add"], kpi_manage: ["kpi_viewAll", "kpi_input"], forms_manage: ["forms_view"], tpl_add: ["tpl_view"], tpl_editAll: ["tpl_add"], min_add: ["min_view"], min_editAll: ["min_add"], fin_view: ["fin_add"], fin_edit: ["fin_view"] };
+const P = keys => Object.fromEntries(PERM_KEYS.map(k => [k, keys.includes(k)]));
+const DEFAULT_PERMS = {
+  sub: P(PERM_KEYS.filter(k => k !== "fin_edit")),
+  member: P(["cal_view", "cal_add", "issue_add", "kpi_input", "forms_view", "tpl_view", "tpl_add", "min_view", "min_add", "fin_add"]),
+  intern: P(["cal_view", "cal_add", "issue_add", "kpi_input", "forms_view", "tpl_view", "min_view", "fin_add"]),
+  viewer: P(["cal_view", "forms_view", "tpl_view", "min_view"])
+};
 const roleOf = m => (m && ROLES.some(([k]) => k === m.role)) ? m.role : "member";
 const myRole = () => S.isAdmin ? "admin" : roleOf(S.member);
-const isSub = () => myRole() === "sub";
-const canManage = () => S.isAdmin || isSub();          // KPIの設定・すべての業務の編集
-const canWrite = () => myRole() !== "viewer";          // 業務の登録・自分の担当分の入力
+const permsOf = r => Object.assign({}, DEFAULT_PERMS[r] || {}, (S.perms && S.perms[r]) || {});
+const can = key => S.isAdmin || (isActive() && permsOf(myRole())[key] === true);
+const myWS = () => isWS(S.user && S.user.email);
+const finView = () => S.isAdmin || (can("fin_view") && myWS());   // すべての記録・集計
+const finEdit = () => S.isAdmin || (can("fin_edit") && myWS());   // すべての記録の編集・CSV取り込み
+const finAdd = () => finEdit() || can("fin_add");                 // 記録の追加（自分の分）
+const roleHelp = r => { const p = permsOf(r); const on = PERM_DEFS.filter(([, a]) => a.some(([k]) => p[k])).map(([g, a]) => g + (a.filter(([k]) => p[k]).length === a.length ? "（すべて）" : "（一部）")); return on.length ? on.join("・") : "ほぼ何もできない"; };
 const roleLabel = r => ({ admin: "管理者", sub: "副管理者", member: "メンバー", viewer: "閲覧のみ" })[r] || "メンバー";
 const rolePill = r => r === "member" ? "" : `<span class="pill ${r === "viewer" ? "plain" : "info"}">${roleLabel(r)}</span>`;
-const canFinance = () => S.isAdmin || (isActive() && S.member && S.member.finance === true);
 const activeMembers = () => S.members.filter(m => m.status === "active").sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
 const memName = id => { const m = S.members.find(x => x.id === id); return m ? (m.name || m.email || "名前未設定") : "（不明）"; };
 const MEMBER_COLORS = ["#1E5FC4", "#0E8A82", "#C27A12", "#C2417A", "#6B4FC2", "#4A7A2A", "#D2462F", "#2E86B8", "#8A5A3C", "#5B6578"];
@@ -127,11 +152,18 @@ const mColor = id => {
   return i < 0 ? "var(--muted)" : MEMBER_COLORS[i % MEMBER_COLORS.length];
 };
 const whoTag = id => `<span class="who" style="--mc:${mColor(id)}"><i></i>${esc(memName(id))}</span>`;
-const tabsVisible = () => TABS_ALL.filter(([k]) => (k !== "money" || canFinance()) && (k !== "admin" || S.isAdmin));
+const TAB_PERM = { cal: "cal_view", forms: "forms_view", templates: "tpl_view", minutes: "min_view" };
+const tabsVisible = () => TABS_ALL.filter(([k]) => (k !== "money" || finAdd()) && (k !== "admin" || S.isAdmin) && (!TAB_PERM[k] || can(TAB_PERM[k])));
 
 /* ================= auth & data lifecycle ================= */
 function stopData() { dataUnsubs.forEach(u => u()); dataUnsubs = []; S.ready = {}; S.need = []; S.tasks = []; S.kpis = []; S.ledger = []; S.members = []; S.config = null; }
-function resetAll() { if (memberUnsub) { memberUnsub(); memberUnsub = null; } stopData(); S.member = null; S.isAdmin = false; S.dataKey = ""; }
+function resetAll() { if (memberUnsub) { memberUnsub(); memberUnsub = null; } if (permsUnsub) { permsUnsub(); permsUnsub = null; } stopData(); S.member = null; S.isAdmin = false; S.dataKey = ""; S.perms = null; S.permsReady = false; }
+/* 権限（本人の段階と権限の表）が変わったら、読み込むデータを組み直す */
+function syncData() {
+  const key = isActive() && S.permsReady ? ["on", myRole(), JSON.stringify(permsOf(myRole())), finView() ? "F" : finAdd() ? "a" : "-"].join("|") : "off";
+  if (key !== S.dataKey) { stopData(); S.dataKey = key; if (key !== "off") startData(); }
+  render();
+}
 
 if (configured) {
   getRedirectResult(auth).catch(e => console.warn(e));
@@ -147,16 +179,18 @@ if (configured) {
         let inv = null;
         if (!S.isAdmin && u.email) { try { const is = await getDoc(doc(db, "invites", u.email.toLowerCase())); if (is.exists()) inv = is.data(); } catch (e) { } }
         const base = { email: u.email || "", createdAt: serverTimestamp() };
-        if (S.isAdmin) await setDoc(ref, { ...base, name: u.displayName || u.email || "", status: "active", finance: true });
+        if (S.isAdmin) await setDoc(ref, { ...base, name: u.displayName || u.email || "", status: "active", finance: false });
         else if (inv) await setDoc(ref, { ...base, name: inv.name, status: "active", finance: !!inv.finance, role: roleOf(inv), ...(inv.color ? { color: inv.color } : {}) });
         else await setDoc(ref, { ...base, name: u.displayName || u.email || "", status: "pending", finance: false });
       }
     } catch (e) { S.fatal = errMsg(e); render(); return; }
     memberUnsub = onSnapshot(ref, s => {
       S.member = s.exists() ? s.data() : null;
-      const key = isActive() ? "on|" + (canFinance() ? "f" : "-") + "|" + myRole() : "off";
-      if (key !== S.dataKey) { stopData(); S.dataKey = key; if (key !== "off") startData(); }
-      render();
+      if (isActive() && !permsUnsub) {
+        permsUnsub = onSnapshot(doc(db, "config", "perms"), ps => { S.perms = ps.exists() ? ps.data() : null; S.permsReady = true; syncData(); },
+          e => { console.warn("perms", e); S.permsReady = true; syncData(); });
+      }
+      syncData();
     }, e => { S.fatal = errMsg(e); render(); });
   });
 }
@@ -189,13 +223,16 @@ function startData() {
   if (notifyOn()) setTimeout(bindForeground, 0);
   listen("members", collection(db, "members"), s => S.members = docsOf(s));
   listen("config", doc(db, "config", "main"), s => S.config = s.exists() ? s.data() : null);
-  listen("tasks", collection(db, "tasks"), s => S.tasks = docsOf(s));
-  listen("forms", collection(db, "forms"), s => S.forms = docsOf(s));
+  // 権限の表がまだ無ければ、管理者が初期値で作る（ルールはこの表を見て判断する）
+  if (S.isAdmin && !S.perms) setDoc(doc(db, "config", "perms"), DEFAULT_PERMS).catch(e => console.warn("perms seed", e));
+  S.tasks = []; S.forms = []; S.minutes = []; S.templates = []; S.issues = [];
+  if (can("cal_view")) listen("tasks", collection(db, "tasks"), s => S.tasks = docsOf(s));
+  if (can("forms_view")) listen("forms", collection(db, "forms"), s => S.forms = docsOf(s));
   listen("issues", collection(db, "issues"), s => S.issues = docsOf(s));
-  listen("minutes", collection(db, "minutes"), s => S.minutes = docsOf(s));
-  listen("templates", collection(db, "templates"), s => S.templates = docsOf(s));
+  if (can("min_view")) listen("minutes", collection(db, "minutes"), s => S.minutes = docsOf(s));
+  if (can("tpl_view")) listen("templates", collection(db, "templates"), s => S.templates = docsOf(s));
   if (S.isAdmin) listen("invites", collection(db, "invites"), s => S.invites = docsOf(s));
-  if (canManage()) listen("kpis", collection(db, "kpis"), s => S.kpis = docsOf(s));
+  if (can("kpi_manage") || can("kpi_viewAll")) listen("kpis", collection(db, "kpis"), s => S.kpis = docsOf(s));
   else {
     // 一般メンバーは「全員に公開」「自分に公開」「自分が担当」のKPIだけを取得（ルール上それ以外は読めない）
     const parts = {};
@@ -203,7 +240,9 @@ function startData() {
     [["viewers", "array-contains", "all"], ["viewers", "array-contains", uid()], ["owner", "==", uid()]].forEach((w, i) =>
       listen("kpis" + i, query(collection(db, "kpis"), where(...w)), s => { parts[i] = docsOf(s); merge(); }));
   }
-  if (canFinance()) listen("ledger", collection(db, "ledger"), s => S.ledger = docsOf(s));
+  // 収支：すべて見られる人は全件、追加だけの人は自分が追加した記録だけ（ルール上それ以外は読めない）
+  if (finView()) listen("ledger", collection(db, "ledger"), s => S.ledger = docsOf(s));
+  else if (finAdd()) listen("ledger", query(collection(db, "ledger"), where("createdBy", "==", uid())), s => S.ledger = docsOf(s));
 }
 
 async function login() {
@@ -255,13 +294,13 @@ const sinceLabel = t => t.before ? `${t.before.d.slice(0, 7) !== t.last.d.slice(
 const viewersLabel = k => (!k.viewers || k.viewers.includes("all")) ? "全員に公開" : "公開：" + k.viewers.map(memName).join("・");
 function kpiRow(k, withEdit) {
   const tap = withEdit ? "" : ` data-act="kpi-detail" data-id="${esc(k.id)}" role="button" tabindex="0" aria-label="${esc(k.name)}の詳細"`;
-  const tools = withEdit && canManage() ? ` <button class="link" type="button" data-act="kpi-edit" data-id="${esc(k.id)}">編集</button> <button class="link" type="button" style="color:var(--bad)" data-act="kpi-del" data-id="${esc(k.id)}">${S.armDel === k.id ? "本当に削除する（もう一度押す）" : "削除"}</button>` : "";
+  const tools = withEdit && can("kpi_manage") ? ` <button class="link" type="button" data-act="kpi-edit" data-id="${esc(k.id)}">編集</button> <button class="link" type="button" style="color:var(--bad)" data-act="kpi-del" data-id="${esc(k.id)}">${S.armDel === k.id ? "本当に削除する（もう一度押す）" : "削除"}</button>` : "";
   if (isTrack(k)) {
     const t = trackInfo(k);
     return `<div class="kpi track${withEdit ? "" : " tap"}"${tap}>
     <div class="name">${esc(k.name)} <span class="pill plain">記録のみ</span>${tools}</div>
     <div class="nums">${t.last ? `<b>${cu(t.last.v, "num")}</b>` : `<b class="muted">—</b>`}${Number(k.target) > 0 ? ` / ${num(k.target)}` : ""}${esc(k.unit || "")} ${t.last ? deltaTag(t, k.unit) : `<span class="muted" style="font-size:.8rem">未記録</span>`}</div>
-    <div class="meta"><span>担当：${whoTag(k.owner)}</span>${t.last ? `<span>${mtgLabel(t.last.d)}（${md(t.last.d)}）時点</span>` : ""}${t.delta !== null ? `<span>${esc(sinceLabel(t))}の増減</span>` : ""}${canManage() ? `<span>${esc(viewersLabel(k))}</span>` : ""}</div>
+    <div class="meta"><span>担当：${whoTag(k.owner)}</span>${t.last ? `<span>${mtgLabel(t.last.d)}（${md(t.last.d)}）時点</span>` : ""}${t.delta !== null ? `<span>${esc(sinceLabel(t))}の増減</span>` : ""}${can("kpi_manage") ? `<span>${esc(viewersLabel(k))}</span>` : ""}</div>
   </div>`;
   }
   const s = kpiStatus(k); const w = Math.min(100, s.rate * 100);
@@ -271,7 +310,7 @@ function kpiRow(k, withEdit) {
     <div class="name">${esc(k.name)} <span class="pill ${s.st.c}">${s.st.t}</span>${tools}</div>
     <div class="nums">${s.t > 0 ? `<b>${cu(s.a.v, "num")}</b> / ${num(s.t)}${esc(k.unit || "")} <span class="muted">（${Math.round(s.rate * 100)}%）</span>` : `<b>${num(s.a.v)}</b>${esc(k.unit || "")} <span class="muted">／ 目標未設定</span>`}</div>
     <div class="meter"><i class="${cls}" style="width:${w}%"></i>${pace}</div>
-    <div class="meta"><span>担当：${whoTag(k.owner)}</span><span>${k.mode === "latest" ? "最新値で集計" : "MTG・月末ごとの合計で集計"}</span>${k.month === THISMONTH && s.t > 0 ? `<span>今日時点の目安：${num(s.t * s.el)}${esc(k.unit || "")}</span>` : ""}${canManage() ? `<span>${esc(viewersLabel(k))}</span>` : ""}</div>
+    <div class="meta"><span>担当：${whoTag(k.owner)}</span><span>${k.mode === "latest" ? "最新値で集計" : "MTG・月末ごとの合計で集計"}</span>${k.month === THISMONTH && s.t > 0 ? `<span>今日時点の目安：${num(s.t * s.el)}${esc(k.unit || "")}</span>` : ""}${can("kpi_manage") ? `<span>${esc(viewersLabel(k))}</span>` : ""}</div>
   </div>`;
 }
 
@@ -282,8 +321,8 @@ const isMine = t => ownersOf(t).includes(uid());
 const whoTags = t => ownersOf(t).map(whoTag).join(" ") || `<span class="muted" style="font-size:.8rem">担当未定</span>`;
 const ownerDots = t => ownersOf(t).map(o => `<i class="od" style="--mc:${mColor(o)}"></i>`).join("");
 const relevant = t => sharedAll(t) || isMine(t) || (t.shareWith || []).includes(uid()) || t.createdBy === uid();
-const canEditTask = t => canManage() || (t.createdBy === uid() && canWrite());
-const canToggleTask = t => canEditTask(t) || (isMine(t) && canWrite());
+const canEditTask = t => can("cal_editAll") || (t.createdBy === uid() && can("cal_add"));
+const canToggleTask = t => canEditTask(t) || (isMine(t) && can("cal_add"));
 const taskTitle = t => t.label ? t.label : t.routine && t.routine !== "__other" ? t.routine : (t.detail || "（内容未記入）");
 const timeLabel = t => !t.start ? "終日" : esc(t.start) + (t.end ? "–" + esc(t.end) : "〜");
 const sortTasks = (a, b) => (a.date + (a.start || "")).localeCompare(b.date + (b.start || ""));
@@ -453,9 +492,9 @@ function vHome() {
   const ks = S.kpis.filter(k => k.month === THISMONTH).sort((a, b) => (a.order || 0) - (b.order || 0));
   const untilMtg = daysBetween(TODAY, NEXTMTG);
   const mtgKpis = S.kpis.filter(k => k.month === NEXTMTG.slice(0, 7));
-  const myKpiNoReport = untilMtg <= 7 && canWrite() ? mtgKpis.filter(k => k.owner === uid() && !((k.weekly || {})[NEXTMTG] && (k.weekly || {})[NEXTMTG].value !== null)) : [];
+  const myKpiNoReport = untilMtg <= 7 && can("kpi_input") ? mtgKpis.filter(k => k.owner === uid() && !((k.weekly || {})[NEXTMTG] && (k.weekly || {})[NEXTMTG].value !== null)) : [];
   let fin = "";
-  if (canFinance()) {
+  if (finView()) {
     const mrows = S.ledger.filter(r => (r.date || "").startsWith(THISMONTH));
     const inc = sumBy(mrows, "収入"), exp = sumBy(mrows, "支出"), bal = sumBy(S.ledger, "収入") - sumBy(S.ledger, "支出");
     const uns = S.ledger.filter(r => r.settled === "未精算").sort((a, b) => (a.date || "").localeCompare(b.date || ""));
@@ -471,10 +510,10 @@ function vHome() {
         ${myOpen ? mine.filter(t => !t.done).map(t => taskItem(t)).join("") : `<p class="muted" style="margin:0">${mine.length ? "今日の業務はすべて完了しました。" : "今日の業務はありません。"}</p>`}
         ${myKpiNoReport.length ? `<div class="banner" style="margin:12px 0 0">${untilMtg === 0 ? "今日" : untilMtg === 1 ? "明日" : untilMtg + "日後"}の${mtgName(NEXTMTG) === "月末" ? "月末締め" : "MTG"}（${md(NEXTMTG)}）までにKPIの報告をお願いします：${myKpiNoReport.map(k => esc(k.name)).join("、")} <button class="link" type="button" data-act="go" data-tab="kpi">入力する</button></div>` : ""}
       </section>
-      <section class="panel"><h3>未対応（全体共有）<span class="hint">${openIssues.length + overdue.length}件</span>${canWrite() ? `<button class="btn small" type="button" data-act="issue-new">＋ 追加</button>` : ""}</h3>
+      <section class="panel"><h3>未対応（全体共有）<span class="hint">${openIssues.length + overdue.length}件</span>${can("issue_add") ? `<button class="btn small" type="button" data-act="issue-new">＋ 追加</button>` : ""}</h3>
         ${openIssues.length ? openIssues.map(issueItem).join("") : ""}
         ${overdue.length ? `<div class="sub-head">期限を過ぎた業務</div>` + overdue.map(t => taskItem(t, { late: true, showDate: true })).join("") : ""}
-        ${!openIssues.length && !overdue.length ? `<p class="muted" style="margin:0">未対応の事項はありません。${canWrite() ? "気づいたことは「＋ 追加」で登録できます。" : ""}</p>` : ""}
+        ${!openIssues.length && !overdue.length ? `<p class="muted" style="margin:0">未対応の事項はありません。${can("issue_add") ? "気づいたことは「＋ 追加」で登録できます。" : ""}</p>` : ""}
         ${doneIssues.length ? `<button class="link done-toggle" type="button" data-act="issue-showdone">${S.showDoneIssues ? "完了済みを隠す" : `完了済み ${doneIssues.length}件を表示`}</button>${S.showDoneIssues ? `<div class="done-list">${doneIssues.map(issueItem).join("")}</div>` : ""}` : ""}
       </section>
       ${myLate.length ? `<section class="panel"><h3>自分の未対応<span class="hint">${myLate.length}件</span></h3>${myLate.map(t => taskItem(t, { late: true, showDate: true })).join("")}</section>` : ""}
@@ -482,7 +521,7 @@ function vHome() {
     </div>
     <div class="stack">
       <section class="panel"><h3>今月のKPI<button class="link hint" type="button" data-act="go" data-tab="kpi">進捗を入力</button></h3>
-        ${ks.length ? ks.map(k => kpiRow(k, false)).join("") : `<p class="muted" style="margin:0">${canManage() ? "今月のKPIはまだ設定されていません。" : "表示できる今月のKPIはありません。"}</p>`}
+        ${ks.length ? ks.map(k => kpiRow(k, false)).join("") : `<p class="muted" style="margin:0">${can("kpi_manage") ? "今月のKPIはまだ設定されていません。" : "表示できる今月のKPIはありません。"}</p>`}
       </section>
       ${fin ? `<div class="fin-r">${fin}</div>` : ""}
     </div>
@@ -492,17 +531,17 @@ function vHome() {
 function vKpi() {
   const m = S.kpiMonth; const ks = S.kpis.filter(k => k.month === m).sort((a, b) => (a.order || 0) - (b.order || 0));
   const weeks = meetingsOfMonth(m); const prev = S.kpis.filter(k => k.month === shiftMonth(m, -1));
-  const head = `<div class="bar"><h2 class="vh">KPI</h2>${monthNav("kpiMonth")}${canManage() ? `<button class="btn" type="button" data-act="kpi-new">KPIを追加</button>` : ""}</div>`;
+  const head = `<div class="bar"><h2 class="vh">KPI</h2>${monthNav("kpiMonth")}${can("kpi_manage") ? `<button class="btn" type="button" data-act="kpi-new">KPIを追加</button>` : ""}</div>`;
   if (!ks.length) {
-    if (!canManage()) return head + `<div class="empty"><p>${monthLabel(m)}に表示できるKPIはありません。</p></div>`;
+    if (!can("kpi_manage")) return head + `<div class="empty"><p>${monthLabel(m)}に表示できるKPIはありません。</p></div>`;
     return head + `<div class="empty"><p>${monthLabel(m)}の月次目標はまだありません。</p>
       ${prev.length ? `<p><button class="btn sec" type="button" data-act="kpi-carry">先月のKPI（${prev.length}件）を引き継ぐ</button></p>` : ""}
       ${KPI_TEMPLATES.length ? `<p class="muted" style="font-size:.85rem">指標を追加する：</p>
       <div class="tpls">${KPI_TEMPLATES.map((t, i) => `<button class="btn sec small" type="button" data-act="kpi-tpl" data-i="${i}">${esc(t.name)}</button>`).join("")}</div>` : `<p><button class="btn small" type="button" data-act="kpi-new">最初のKPIを追加</button></p>`}</div>`;
   }
   const rows = ks.map(k => {
-    const w = k.weekly || {}; const editable = canManage() || (k.owner === uid() && canWrite());
-    const tools = canManage() ? `<div class="kpi-tools"><button class="link" type="button" data-act="kpi-edit" data-id="${esc(k.id)}">編集</button></div>` : "";
+    const w = k.weekly || {}; const editable = can("kpi_manage") || (k.owner === uid() && can("kpi_input"));
+    const tools = can("kpi_manage") ? `<div class="kpi-tools"><button class="link" type="button" data-act="kpi-edit" data-id="${esc(k.id)}">編集</button></div>` : "";
     const tgt = Number(k.target) > 0 ? `目標 ${num(k.target)}${esc(k.unit || "")}` : "目標未設定";
     return `<tr><td><span class="kname"><b>${esc(k.name)}</b>${isTrack(k) ? ` <span class="pill plain">記録のみ</span>` : ""}</span><div class="muted" style="font-size:.75rem">${esc(memName(k.owner))}・${k.mode === "latest" ? "最新値" : "合計"}・${tgt}</div>${tools}</td>
       ${weeks.map(wk => { const v = w[wk] && w[wk].value !== null && w[wk].value !== undefined ? w[wk].value : "";
@@ -536,11 +575,11 @@ function vCal() {
   const dayList = (byDay[S.selDay] || []).sort(sortTasks);
   return `<div class="bar"><h2 class="vh">業務カレンダー</h2>
     <label class="muted" style="font-size:.85rem;display:flex;gap:6px;align-items:center"><input type="checkbox" id="onlymine" data-act="onlymine" ${S.onlyMine ? "checked" : ""}>自分に関係する業務だけ</label>
-    ${monthNav("calMonth")}${canWrite() ? `<button class="btn" type="button" data-act="task-new">業務を登録</button>` : `<span class="pill plain">閲覧のみ</span>`}</div>
+    ${monthNav("calMonth")}${can("cal_add") ? `<button class="btn" type="button" data-act="task-new">業務を登録</button>` : `<span class="pill plain">閲覧のみ</span>`}</div>
   <div class="callayout">
     <div class="stack"><div class="cal">${cells}</div>
       <div class="legend">${activeMembers().map(m => whoTag(m.id)).join("")}</div></div>
-    <section class="panel day-panel"><h3>${md(S.selDay)}${S.selDay === TODAY ? "　今日" : ""}${canWrite() ? `<button class="btn small" style="margin-left:auto" type="button" data-act="task-new" data-d="${S.selDay}">この日に登録</button>` : ""}</h3>
+    <section class="panel day-panel"><h3>${md(S.selDay)}${S.selDay === TODAY ? "　今日" : ""}${can("cal_add") ? `<button class="btn small" style="margin-left:auto" type="button" data-act="task-new" data-d="${S.selDay}">この日に登録</button>` : ""}</h3>
       ${dayList.length ? dayList.map(t => taskItem(t)).join("") : `<p class="muted" style="margin:0">この日の業務はありません。</p>`}
     </section>
   </div>`;
@@ -590,7 +629,20 @@ function bankBalance(asOf) {
   }
   return { bal, pending: list.reduce((a, b) => a + b.amount, 0), pays };
 }
+const canEditLed = r => finEdit() || (r.createdBy === uid() && finAdd() && !r.confirmed);
+const ledStatus = r => r.confirmed ? `<span class="pill good">確認済</span>` : `<span class="pill plain">未確認</span>`;
+/* 収支を「追加だけ」できる人の画面：自分が追加した記録だけ */
+function vMyLedger() {
+  const rows = S.ledger.filter(r => r.createdBy === uid()).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  const head = `<div class="bar"><h2 class="vh">収支</h2><span class="muted" style="font-size:.85rem;margin-right:auto">あなたが記録したものだけが表示されます</span><button class="btn" type="button" data-act="led-new">収支を記録</button></div>
+    <p class="muted" style="font-size:.82rem;margin:-8px 0 14px">管理者が確認すると「確認済」になり、それ以降は編集できません。間違いに気づいたら管理者に連絡してください。</p>`;
+  if (!rows.length) return head + `<div class="empty"><p>まだ記録はありません。</p><button class="btn small" type="button" data-act="led-new">記録を追加</button></div>`;
+  return head + `<div class="tablewrap"><table class="ledger-table"><thead><tr><th>日付</th><th>項目</th><th>区分</th><th>カテゴリ</th><th class="num">金額</th><th>担当者</th><th>支払方法</th><th>状態</th></tr></thead><tbody>
+    ${rows.map(r => `<tr class="${canEditLed(r) ? "click" : ""}" ${canEditLed(r) ? `data-act="led-edit" data-id="${esc(r.id)}" tabindex="0"` : ""}><td class="c-date">${md(r.date)}</td><td class="c-title" style="white-space:normal;min-width:12em">${esc(r.title)}${r.memo ? `<div class="muted" style="font-size:.75rem">${esc(r.memo)}</div>` : ""}</td><td class="c-meta"><span class="pill ${r.type === "収入" ? "good" : "bad"}">${esc(r.type)}</span></td><td class="c-meta">${esc(r.category || "")}</td><td class="num c-amt ${r.type === "収入" ? "pos" : "neg"}">${r.type === "収入" ? "+" : "−"}${yen(r.amount)}</td><td class="c-meta">${esc(r.owner || "")}</td><td class="c-meta">${esc(r.method || "")}</td><td class="c-meta">${ledStatus(r)}</td><td class="c-sub">${esc([r.category, r.method].filter(Boolean).join("・"))} ${ledStatus(r)}</td></tr>`).join("")}
+  </tbody></table></div>`;
+}
 function vMoney() {
+  if (!finView()) return vMyLedger();
   const m = S.moneyMonth; const rows = S.ledger.filter(r => (r.date || "").startsWith(m)).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
   const inc = sumBy(rows, "収入"), exp = sumBy(rows, "支出");
   const monthEnd = ymd(new Date(Number(m.slice(0, 4)), Number(m.slice(5, 7)), 0));
@@ -601,7 +653,7 @@ function vMoney() {
   const maxC = Math.max(1, ...Object.values(cats), ...Object.values(icats));
   const bars = (o, cls) => Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<div class="hbar ${cls}"><span>${esc(k)}</span><span class="track"><i style="width:${(v / maxC * 100).toFixed(1)}%"></i></span><span class="val">${yen(v)}</span></div>`).join("");
   const stPill = s => s === "未精算" ? `<span class="pill warn">未精算</span>` : s === "精算済" ? `<span class="pill good">精算済</span>` : `<span class="pill plain">${esc(s || "対象外")}</span>`;
-  return `<div class="bar"><h2 class="vh">収支</h2>${monthNav("moneyMonth")}${S.isAdmin ? `<button class="btn sec" type="button" data-act="led-import">CSVを取り込む</button><button class="btn" type="button" data-act="led-new">収支を記録</button>` : `<span class="pill plain">閲覧のみ</span>`}</div>
+  return `<div class="bar"><h2 class="vh">収支</h2>${monthNav("moneyMonth")}${finEdit() ? `<button class="btn sec" type="button" data-act="led-import">CSVを取り込む</button>` : ""}${finAdd() ? `<button class="btn" type="button" data-act="led-new">収支を記録</button>` : ""}${!finEdit() ? `<span class="pill plain">${finAdd() ? "閲覧と自分の記録の追加" : "閲覧のみ"}</span>` : ""}</div>
   <div class="figs money-figs">
     <div class="fig"><div class="k">収入</div><div class="v pos">${cu(inc, "yen")}</div></div>
     <div class="fig"><div class="k">支出</div><div class="v neg">${cu(exp, "yen")}</div></div>
@@ -614,8 +666,8 @@ function vMoney() {
   </div>
   <div class="stack">
     ${rows.length ? `<div class="tablewrap"><table class="ledger-table"><thead><tr><th>日付</th><th>項目</th><th>区分</th><th>カテゴリ</th><th class="num">金額</th><th>担当者</th><th>支払方法</th><th>精算</th></tr></thead><tbody>
-      ${rows.map(r => `<tr class="${S.isAdmin ? "click" : ""}" ${S.isAdmin ? `data-act="led-edit" data-id="${esc(r.id)}" tabindex="0"` : ""}><td class="c-date">${md(r.date)}</td><td class="c-title" style="white-space:normal;min-width:12em">${esc(r.title)}${r.memo ? `<div class="muted" style="font-size:.75rem">${esc(r.memo)}</div>` : ""}</td><td class="c-meta"><span class="pill ${r.type === "収入" ? "good" : "bad"}">${esc(r.type)}</span></td><td class="c-meta">${esc(r.category || "")}</td><td class="num c-amt ${r.type === "収入" ? "pos" : "neg"}">${r.type === "収入" ? "+" : "−"}${yen(r.amount)}</td><td class="c-meta">${esc(r.owner || "")}</td><td class="c-meta">${esc(r.method || "")}</td><td class="c-meta">${stPill(r.settled)}</td><td class="c-sub">${esc([r.category, r.owner, r.method].filter(Boolean).join("・"))} ${stPill(r.settled)}</td></tr>`).join("")}
-    </tbody></table></div>` : `<div class="empty"><p>${monthLabel(m)}の記録はありません。</p>${S.isAdmin ? `<button class="btn small" type="button" data-act="led-new">記録を追加</button>` : ""}</div>`}
+      ${rows.map(r => `<tr class="${canEditLed(r) ? "click" : ""}" ${canEditLed(r) ? `data-act="led-edit" data-id="${esc(r.id)}" tabindex="0"` : ""}><td class="c-date">${md(r.date)}</td><td class="c-title" style="white-space:normal;min-width:12em">${esc(r.title)}${r.memo ? `<div class="muted" style="font-size:.75rem">${esc(r.memo)}</div>` : ""}<div class="muted" style="font-size:.72rem">記録：${esc(r.createdBy ? memName(r.createdBy) : "—")}${r.confirmed ? "・確認済" : "・未確認"}</div></td><td class="c-meta"><span class="pill ${r.type === "収入" ? "good" : "bad"}">${esc(r.type)}</span></td><td class="c-meta">${esc(r.category || "")}</td><td class="num c-amt ${r.type === "収入" ? "pos" : "neg"}">${r.type === "収入" ? "+" : "−"}${yen(r.amount)}</td><td class="c-meta">${esc(r.owner || "")}</td><td class="c-meta">${esc(r.method || "")}</td><td class="c-meta">${stPill(r.settled)}</td><td class="c-sub">${esc([r.category, r.owner, r.method].filter(Boolean).join("・"))} ${stPill(r.settled)}</td></tr>`).join("")}
+    </tbody></table></div>` : `<div class="empty"><p>${monthLabel(m)}の記録はありません。</p>${finAdd() ? `<button class="btn small" type="button" data-act="led-new">記録を追加</button>` : ""}</div>`}
     ${rows.length ? `<div class="grid2"><section class="panel"><h3>支出の内訳</h3>${Object.keys(cats).length ? bars(cats, "out") : `<p class="muted" style="margin:0">支出はありません。</p>`}</section>
       <section class="panel"><h3>収入の内訳</h3>${Object.keys(icats).length ? bars(icats, "") : `<p class="muted" style="margin:0">収入はありません。</p>`}</section></div>` : ""}
   </div>`;
@@ -627,14 +679,13 @@ function inviteDialog() {
   const body = fld("Gmailアドレス", `<input type="email" name="email" id="f-email" required autocomplete="off" placeholder="例：yamada.taro@gmail.com">`, { full: true, req: true, help: "その人がログインに使うGoogleアカウントのアドレス" }) +
     fld("表示名", `<input name="name" id="f-name" required placeholder="例：山田">`, { req: true, help: "カレンダーやKPIに出る名前" }) +
     `<div class="field"><span class="lbl">色</span><div class="swatches" role="radiogroup" aria-label="色">${MEMBER_COLORS.map((c, i) => `<label class="sw-pick"><input type="radio" name="color" id="f-color-${i}" value="${c}" ${i === activeMembers().length % MEMBER_COLORS.length ? "checked" : ""}><span class="swatch" style="background:${c}" title="${c}"></span></label>`).join("")}</div></div>` +
-    `<div class="field full"><span class="lbl">権限</span><div class="role-pick">${ROLES.map(([k, l]) => `<label class="role-opt"><input type="radio" name="role" id="f-role-${k}" value="${k}" ${k === "member" ? "checked" : ""}><span><b>${l}</b><small>${ROLE_HELP[k]}</small></span></label>`).join("")}</div></div>` +
-    `<div class="field full"><label class="checks" style="font-size:.88rem"><input type="checkbox" name="finance" id="f-finance" value="1">収支を見られるようにする（閲覧のみ）</label></div>`;
+    `<div class="field full"><span class="lbl">権限</span><div class="role-pick">${ROLES.map(([k, l]) => `<label class="role-opt"><input type="radio" name="role" id="f-role-${k}" value="${k}" ${k === "member" ? "checked" : ""}><span><b>${l}</b><small>${esc(roleHelp(k))}</small></span></label>`).join("")}</div><span class="help">それぞれの段階でできることは「管理 → 設定 → 権限」で変えられます。収支の閲覧・編集は shincareer.com のアカウントだけです</span></div>`;
   openDlg("メンバーを追加", body, {
     submit: async f => {
       const email = (f.email || "").trim().toLowerCase(); const name = (f.name || "").trim();
       if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return showErr("メールアドレスの形式が正しくありません。"), false;
       if (!name) return showErr("表示名を入力してください。"), false;
-      const data = { name, color: f.color || null, finance: !!f.finance, role: roleOf({ role: f.role }) };
+      const data = { name, color: f.color || null, finance: false, role: roleOf({ role: f.role }) };
       const existing = S.members.find(m => (m.email || "").toLowerCase() === email);
       if (existing) {
         await updateDoc(doc(db, "members", existing.id), { ...data, status: "active" });
@@ -662,27 +713,27 @@ const safeUrl = u => /^https:\/\/[^\s"'<>]+$/i.test(u || "") ? u : "";
 const formShareText = f => (f.message ? f.message.trim() + "\n" : "") + f.url;
 function vForms() {
   const list = [...(S.forms || [])].sort((a, b) => (a.order || 0) - (b.order || 0));
-  const head = `<div class="bar"><h2 class="vh">フォーム</h2>${canManage() ? `<button class="btn" type="button" data-act="form-new">フォームを追加</button>` : ""}</div>
+  const head = `<div class="bar"><h2 class="vh">フォーム</h2>${can("forms_manage") ? `<button class="btn" type="button" data-act="form-new">フォームを追加</button>` : ""}</div>
     <p class="muted" style="font-size:.85rem;margin:-8px 0 14px">ユーザーや取引先に送るGoogleフォームのリンク集です。「案内文をコピー」で、メールやDMに貼り付けて送れます。</p>`;
-  if (!list.length) return head + `<div class="empty"><p>まだフォームが登録されていません。</p>${canManage() ? `<button class="btn small" type="button" data-act="form-new">最初のフォームを追加</button>` : `<p class="muted">管理者が追加すると、ここに表示されます。</p>`}</div>`;
+  if (!list.length) return head + `<div class="empty"><p>まだフォームが登録されていません。</p>${can("forms_manage") ? `<button class="btn small" type="button" data-act="form-new">最初のフォームを追加</button>` : `<p class="muted">管理者が追加すると、ここに表示されます。</p>`}</div>`;
   return head + `<div class="form-grid">${list.map((f, i) => `<article class="panel form-card">
-      <div class="fc-head"><h3>${esc(f.name)}</h3>${canManage() ? `<span class="fc-tools"><button class="icon-btn" type="button" data-act="form-up" data-id="${esc(f.id)}" aria-label="上へ" ${i === 0 ? "disabled" : ""}>↑</button><button class="icon-btn" type="button" data-act="form-down" data-id="${esc(f.id)}" aria-label="下へ" ${i === list.length - 1 ? "disabled" : ""}>↓</button><button class="link" type="button" data-act="form-edit" data-id="${esc(f.id)}">編集</button></span>` : ""}</div>
+      <div class="fc-head"><h3>${esc(f.name)}</h3>${can("forms_manage") ? `<span class="fc-tools"><button class="icon-btn" type="button" data-act="form-up" data-id="${esc(f.id)}" aria-label="上へ" ${i === 0 ? "disabled" : ""}>↑</button><button class="icon-btn" type="button" data-act="form-down" data-id="${esc(f.id)}" aria-label="下へ" ${i === list.length - 1 ? "disabled" : ""}>↓</button><button class="link" type="button" data-act="form-edit" data-id="${esc(f.id)}">編集</button></span>` : ""}</div>
       ${f.desc ? `<p class="fc-desc">${esc(f.desc)}</p>` : ""}
       ${f.message ? `<div class="fc-msg"><span class="lbl">送るときの文面</span><p>${esc(f.message)}</p></div>` : ""}
       <div class="fc-url">${esc(f.url)}</div>
-      <div class="fc-acts"><button class="btn" type="button" data-act="form-copy" data-id="${esc(f.id)}">${f.message ? "案内文をコピー" : "リンクをコピー"}</button>${f.message ? `<button class="btn sec" type="button" data-act="form-copy-url" data-id="${esc(f.id)}">リンクだけ</button>` : ""}<a class="btn sec" href="${esc(safeUrl(f.url))}" target="_blank" rel="noopener">開く</a>${canManage() && safeUrl(f.editUrl) ? `<a class="btn sec" href="${esc(safeUrl(f.editUrl))}" target="_blank" rel="noopener">編集する</a>` : ""}${canManage() && safeUrl(f.respUrl) ? `<a class="link" href="${esc(safeUrl(f.respUrl))}" target="_blank" rel="noopener">回答を見る</a>` : ""}</div>
+      <div class="fc-acts"><button class="btn" type="button" data-act="form-copy" data-id="${esc(f.id)}">${f.message ? "案内文をコピー" : "リンクをコピー"}</button>${f.message ? `<button class="btn sec" type="button" data-act="form-copy-url" data-id="${esc(f.id)}">リンクだけ</button>` : ""}<a class="btn sec" href="${esc(safeUrl(f.url))}" target="_blank" rel="noopener">開く</a>${can("forms_manage") && safeUrl(f.editUrl) ? `<a class="btn sec" href="${esc(safeUrl(f.editUrl))}" target="_blank" rel="noopener">編集する</a>` : ""}${can("forms_manage") && safeUrl(f.respUrl) ? `<a class="link" href="${esc(safeUrl(f.respUrl))}" target="_blank" rel="noopener">回答を見る</a>` : ""}</div>
     </article>`).join("")}</div>`;
 }
 /* ===================== テンプレ一覧 ===================== */
-const canEditTpl = tp => canManage() || (tp.createdBy === uid() && canWrite());
+const canEditTpl = tp => can("tpl_editAll") || (tp.createdBy === uid() && can("tpl_add"));
 function vTemplates() {
   const list = [...(S.templates || [])].sort((a, b) => (a.order || 0) - (b.order || 0));
   const cats = [...new Set(list.map(x => x.category).filter(Boolean))];
   if (S.tplCat !== "all" && !cats.includes(S.tplCat)) S.tplCat = "all";
   const shown = list.filter(x => S.tplCat === "all" || x.category === S.tplCat);
-  const head = `<div class="bar"><h2 class="vh">テンプレ一覧</h2><input type="search" id="tpl-q" class="tpl-q" placeholder="タイトル・本文で検索" value="${esc(S.tplQ || "")}" aria-label="テンプレを検索">${canWrite() ? `<button class="btn" type="button" data-act="tpl-new">テンプレを追加</button>` : ""}</div>
+  const head = `<div class="bar"><h2 class="vh">テンプレ一覧</h2><input type="search" id="tpl-q" class="tpl-q" placeholder="タイトル・本文で検索" value="${esc(S.tplQ || "")}" aria-label="テンプレを検索">${can("tpl_add") ? `<button class="btn" type="button" data-act="tpl-new">テンプレを追加</button>` : ""}</div>
     ${cats.length ? `<div class="tpl-cats" role="group" aria-label="カテゴリ">${[["all", "すべて"], ...cats.map(c => [c, c])].map(([v, l]) => `<button type="button" class="tpl-cat${S.tplCat === v ? " on" : ""}" data-act="tpl-cat" data-v="${esc(v)}" aria-pressed="${S.tplCat === v}">${esc(l)}<span>${v === "all" ? list.length : list.filter(x => x.category === v).length}</span></button>`).join("")}</div>` : ""}`;
-  if (!list.length) return head + `<div class="empty"><p>まだテンプレがありません。</p><p class="muted" style="font-size:.85rem">営業メール、ユーザーインタビューの依頼、問い合わせへの返信など、よく送る文章を入れておくと「コピー」ですぐ使えます。</p>${canWrite() ? `<button class="btn small" type="button" data-act="tpl-new">最初のテンプレを追加</button>` : ""}</div>`;
+  if (!list.length) return head + `<div class="empty"><p>まだテンプレがありません。</p><p class="muted" style="font-size:.85rem">営業メール、ユーザーインタビューの依頼、問い合わせへの返信など、よく送る文章を入れておくと「コピー」ですぐ使えます。</p>${can("tpl_add") ? `<button class="btn small" type="button" data-act="tpl-new">最初のテンプレを追加</button>` : ""}</div>`;
   return head + `<div class="tpl-grid">${shown.map(tp => `<article class="panel tpl-card" data-text="${esc((tp.title + " " + tp.body + " " + (tp.category || "")).toLowerCase())}">
       <div class="tpl-h"><h3>${esc(tp.title)}</h3>${tp.category ? `<span class="pill plain">${esc(tp.category)}</span>` : ""}</div>
       <div class="tpl-body">${esc(tp.body)}</div>
@@ -719,7 +770,7 @@ function tplDialog(tp) {
 const MIN_STALE = 20 * 60 * 1000;
 const tsMs = t => (t && t.toMillis ? t.toMillis() : 0);
 const minTime = m => tsMs(m.createdAt);
-const canEditMin = m => canManage() || (m.createdBy === uid() && canWrite());
+const canEditMin = m => can("min_editAll") || (m.createdBy === uid() && can("min_add"));
 const minBusy = m => m.status === "pending" || m.status === "processing";
 const minStuck = m => { const t = Math.max(minTime(m), tsMs(m.queuedAt), m.startedAt ? Date.parse(m.startedAt) || 0 : 0); return minBusy(m) && t > 0 && Date.now() - t > MIN_STALE; };
 function minStatusPill(m) {
@@ -731,9 +782,9 @@ const minTitle = m => m.title || "MTGの議事録";
 function vMinutes() {
   const list = [...(S.minutes || [])].sort((a, b) => (b.date || "").localeCompare(a.date || "") || minTime(b) - minTime(a));
   if (S.minId) { const m = list.find(x => x.id === S.minId); if (m) return vMinuteDetail(m); S.minId = null; }
-  const head = `<div class="bar"><h2 class="vh">議事録</h2>${canWrite() ? `<button class="btn" type="button" data-act="min-new">議事録を追加</button>` : ""}</div>
+  const head = `<div class="bar"><h2 class="vh">議事録</h2>${can("min_add") ? `<button class="btn" type="button" data-act="min-new">議事録を追加</button>` : ""}</div>
     <p class="muted" style="font-size:.85rem;margin:-8px 0 14px">MTGの音声を文字起こししたものを貼り付けると、5〜15分ほどで「決定・やること・持ち越し」に自動でまとまります。「詳細を見る」で、議題ごとの詳しい内容も見られます。</p>`;
-  if (!list.length) return head + `<div class="empty"><p>まだ議事録がありません。</p>${canWrite() ? `<button class="btn small" type="button" data-act="min-new">最初の議事録を追加</button>` : ""}</div>`;
+  if (!list.length) return head + `<div class="empty"><p>まだ議事録がありません。</p>${can("min_add") ? `<button class="btn small" type="button" data-act="min-new">最初の議事録を追加</button>` : ""}</div>`;
   return head + `<div class="min-list">${list.map(m => `<article class="panel min-card">
       <div class="min-card-h"><b>${m.date ? md(m.date) : ""} ${esc(minTitle(m))}</b>${minStatusPill(m)}</div>
       ${m.status === "done" ? minBrief(m) : `<p class="muted" style="margin:0;font-size:.85rem">${minBusy(m) && !minStuck(m) ? "自動でまとめています。5〜15分ほどで、ここに決定事項とやることが出ます。" : "うまくまとめられませんでした。詳細から、もう一度まとめてください。"}</p>`}
@@ -764,7 +815,7 @@ function vMinuteDetail(m) {
     ${minList("決定事項", sm.decisions, "決まったことはありませんでした")}
     <section class="panel min-sec"><h3>やること</h3>${todos.length ? `<div class="min-todos">${todos.map((t, i) => `<div class="min-todo">
         <div><b>${esc(t.task)}</b><span class="muted">${t.owner ? "担当：" + esc(t.owner) : "担当：未定"}${t.due ? "・期限：" + md(t.due) : ""}</span></div>
-        ${t.issueId ? `<span class="pill good">未対応事項に追加済み</span>` : canWrite() ? `<button class="btn sec small" type="button" data-act="min-todo" data-id="${esc(m.id)}" data-i="${i}">未対応事項に追加</button>` : ""}</div>`).join("")}</div>` : `<p class="muted" style="margin:0">やることはありませんでした</p>`}</section>
+        ${t.issueId ? `<span class="pill good">未対応事項に追加済み</span>` : can("issue_add") ? `<button class="btn sec small" type="button" data-act="min-todo" data-id="${esc(m.id)}" data-i="${i}">未対応事項に追加</button>` : ""}</div>`).join("")}</div>` : `<p class="muted" style="margin:0">やることはありませんでした</p>`}</section>
     ${minList("持ち越し", sm.pending, "なし")}`;
   return `<div class="bar">${back}<span class="sp"></span>${tools}</div>
     <div class="min-head"><span class="muted">${m.date ? md(m.date) : ""}・追加：${esc(memName(m.createdBy))}</span><h2>${esc(minTitle(m))}</h2></div>
@@ -871,6 +922,12 @@ async function copyPlain(t, msg) {
   try { await navigator.clipboard.writeText(t); toast(msg); }
   catch (e) { const ta = document.createElement("textarea"); ta.value = t; document.body.appendChild(ta); ta.select(); try { document.execCommand("copy"); toast(msg); } catch (_) { toast("コピーできませんでした", "error"); } ta.remove(); }
 }
+function finLabel(m) {
+  const p = permsOf(roleOf(m)), ws = isWS(m.email);
+  if ((p.fin_edit || p.fin_view) && ws) return `<span class="pill info">${p.fin_edit ? "閲覧・編集" : "閲覧"}</span>`;
+  if (p.fin_add) return `<span class="pill plain">追加のみ</span>${(p.fin_view || p.fin_edit) && !ws ? `<div class="seen">shincareer.com 以外のため閲覧不可</div>` : ""}`;
+  return `<span class="muted">なし</span>`;
+}
 function vMembers() {
   const list = [...S.members].sort((a, b) => ({ pending: 0, active: 1, inactive: 2 }[a.status] ?? 3) - ({ pending: 0, active: 1, inactive: 2 }[b.status] ?? 3) || (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
   const st = s => s === "active" ? `<span class="pill good">利用中</span>` : s === "pending" ? `<span class="pill warn">承認待ち</span>` : `<span class="pill plain">停止中</span>`;
@@ -878,18 +935,18 @@ function vMembers() {
   return `<div class="bar"><h2>メンバー</h2><button class="btn" type="button" data-act="inv-new">メンバーを追加</button></div>
   <p class="muted" style="font-size:.85rem;margin:-8px 0 14px">「拒否」「利用停止」にした人は「削除」で名簿から消せます。消した人がもう一度ログインした場合は、また「承認待ち」で表示されます。「メンバーを追加」でGmailアドレスを登録しておくと、その人がGoogleでログインした瞬間に、承認なしで使えるようになります。登録していない人がログインした場合は「承認待ち」で表示されます。</p>
   ${invites.length ? `<section class="panel" style="margin-bottom:16px"><h3>追加済み・まだログインしていない人<span class="hint">${invites.length}人</span></h3>
-    ${invites.map(iv => `<div class="inv-row"><span class="who" style="--mc:${iv.color || "var(--muted)"}"><i></i><b>${esc(iv.name)}</b></span><span class="muted inv-mail">${esc(iv.id)}</span>${rolePill(roleOf(iv))}${iv.finance ? `<span class="pill info">収支閲覧</span>` : ""}<span class="sp"></span><button class="btn sec small" type="button" data-act="inv-copy" data-id="${esc(iv.id)}">案内文をコピー</button><button class="link" type="button" style="color:var(--bad)" data-act="inv-del" data-id="${esc(iv.id)}">${S.armDel === "inv:" + iv.id ? "本当に取り消す" : "取り消す"}</button></div>`).join("")}
+    ${invites.map(iv => `<div class="inv-row"><span class="who" style="--mc:${iv.color || "var(--muted)"}"><i></i><b>${esc(iv.name)}</b></span><span class="muted inv-mail">${esc(iv.id)}</span>${rolePill(roleOf(iv))}<span class="sp"></span><button class="btn sec small" type="button" data-act="inv-copy" data-id="${esc(iv.id)}">案内文をコピー</button><button class="link" type="button" style="color:var(--bad)" data-act="inv-del" data-id="${esc(iv.id)}">${S.armDel === "inv:" + iv.id ? "本当に取り消す" : "取り消す"}</button></div>`).join("")}
   </section>` : ""}
-  <div class="tablewrap"><table class="members-table"><thead><tr><th>表示名</th><th>色</th><th>Googleアカウント・最終利用</th><th>状態</th><th>権限</th><th>収支の閲覧</th><th></th></tr></thead><tbody>
+  <div class="tablewrap"><table class="members-table"><thead><tr><th>表示名</th><th>色</th><th>Googleアカウント・最終利用</th><th>状態</th><th>権限</th><th>収支</th><th></th></tr></thead><tbody>
   ${list.map(m => { const self = m.id === uid(); return `<tr>
     <td><input class="name-in" id="mn-${esc(m.id)}" value="${esc(m.name || "")}" data-act="mem-name" data-id="${esc(m.id)}" aria-label="表示名"></td>
     <td><div class="swatches" role="group" aria-label="${esc(m.name || "")}の色">${MEMBER_COLORS.map(c => `<button type="button" class="swatch" style="background:${c}" data-act="mem-color" data-id="${esc(m.id)}" data-c="${c}" aria-label="色 ${c}" aria-pressed="${mColor(m.id) === c}"></button>`).join("")}</div></td>
     <td>${esc(m.email || "")}${m.status === "pending" ? "" : `<div class="seen${m.lastSeen && Date.now() - m.lastSeen.toMillis() > 14 * 864e5 ? " old" : ""}">最終利用：${esc(seenLabel(m.lastSeen))}</div>`}</td><td>${st(m.status)}</td>
     <td>${self ? `<span class="muted">管理者</span>` : `<select class="role-sel" id="mr-${esc(m.id)}" data-act="mem-role" data-id="${esc(m.id)}" aria-label="${esc(m.name || "")}の権限">${ROLES.map(([k, l]) => `<option value="${k}" ${roleOf(m) === k ? "selected" : ""}>${l}</option>`).join("")}</select>`}</td>
-    <td>${self ? `<span class="muted">管理者</span>` : `<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="mf-${esc(m.id)}" data-act="mem-fin" data-id="${esc(m.id)}" ${m.finance ? "checked" : ""}>見られる</label>`}</td>
+    <td>${self ? `<span class="muted">すべて</span>` : finLabel(m)}</td>
     <td>${self ? "" : m.status === "pending" ? `<button class="btn small" type="button" data-act="mem-status" data-id="${esc(m.id)}" data-v="active">承認する</button> <button class="btn sec small" type="button" data-act="mem-status" data-id="${esc(m.id)}" data-v="inactive">拒否</button>` : m.status === "active" ? `<button class="btn sec small" type="button" data-act="mem-status" data-id="${esc(m.id)}" data-v="inactive">利用停止</button>` : `<button class="btn sec small" type="button" data-act="mem-status" data-id="${esc(m.id)}" data-v="active">再開する</button> <button class="btn small ${S.armDel === "mem:" + m.id ? "danger" : "sec danger-sec"}" type="button" data-act="mem-del" data-id="${esc(m.id)}">${S.armDel === "mem:" + m.id ? "本当に削除する" : "削除"}</button>`}</td></tr>`; }).join("")}
   </tbody></table></div>
-  <div class="role-legend"><b>権限の違い</b><ul>${ROLES.map(([k, l]) => `<li><b>${l}</b>：${ROLE_HELP[k]}</li>`).join("")}<li><b>管理者</b>：上記すべて＋メンバー管理・設定・収支の編集</li></ul><span class="muted">「収支の閲覧」は権限とは別に、1人ずつ選べます（編集は管理者だけ）。</span></div>`;
+  <div class="role-legend"><b>権限の違い</b><ul>${ROLES.map(([k, l]) => `<li><b>${l}</b>：${esc(roleHelp(k))}</li>`).join("")}<li><b>管理者</b>：すべて＋メンバー管理・設定</li></ul><span class="muted">細かい内容は「設定」タブの「権限」で変えられます。収支の閲覧・編集は shincareer.com のアカウントだけに限られます。</span></div>`;
 }
 
 const rowHTML = (key, i, x, label) => `<div class="row"><button type="button" class="handle" aria-label="並べ替え（↑↓キーで移動）" title="ドラッグして並べ替え"><svg width="12" height="18" viewBox="0 0 12 18" aria-hidden="true" fill="currentColor"><circle cx="3" cy="3" r="1.6"/><circle cx="9" cy="3" r="1.6"/><circle cx="3" cy="9" r="1.6"/><circle cx="9" cy="9" r="1.6"/><circle cx="3" cy="15" r="1.6"/><circle cx="9" cy="15" r="1.6"/></svg></button><input id="s-${key}-${i}" value="${esc(x)}" aria-label="${esc(label || "項目")}"><button class="btn sec small" type="button" data-rm>外す</button></div>`;
@@ -898,6 +955,27 @@ function notifyTimeSelect(cur) {
   const opts = []; for (let h = 5; h <= 10; h++) for (const m of [0, 15, 30, 45]) opts.push(pad(h) + ":" + pad(m));
   return `<select id="s-notifyTime">${opts.map(o => `<option ${o === cur ? "selected" : ""}>${o}</option>`).join("")}</select>`;
 }
+function permTable() {
+  const roles = ROLES;
+  const rows = PERM_DEFS.map(([g, items]) => `<tr class="pt-group"><th colspan="${roles.length + 1}">${esc(g)}</th></tr>` + items.map(([k, l]) => `<tr><td class="pt-label">${esc(l)}</td>${roles.map(([r, rl]) => `<td class="pt-cell"><input type="checkbox" data-perm="${r}|${k}" id="pm-${r}-${k}" aria-label="${esc(rl)}：${esc(g)} ${esc(l)}" ${permsOf(r)[k] ? "checked" : ""}></td>`).join("")}</tr>`).join("")).join("");
+  return `<section class="panel perm-panel" style="margin-bottom:16px"><h3>権限<span class="hint">段階ごとにできること</span></h3>
+    <p class="muted" style="font-size:.8rem;margin:-4px 0 10px">管理者はすべてできます。ここでの設定はサーバー側のルールにも反映されるので、オフにした操作は画面以外からもできません。オンにすると、前提になる項目（例：「見る」）も自動でオンになります。</p>
+    <div class="tablewrap pt-wrap"><table class="perm-table"><thead><tr><th>できること</th>${roles.map(([, rl]) => `<th class="pt-cell">${esc(rl)}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table></div>
+    <p class="muted" style="font-size:.78rem;margin:8px 0 0">「保存」を押すまで反映されません。</p></section>`;
+}
+function readPermTable() {
+  const out = {}; ROLES.forEach(([r]) => { out[r] = Object.fromEntries(PERM_KEYS.map(k => [k, false])); });
+  document.querySelectorAll("[data-perm]").forEach(el => { const [r, k] = el.dataset.perm.split("|"); if (out[r]) out[r][k] = el.checked; });
+  return out;
+}
+/* 前提になる項目の連動：オン → 前提もオン、オフ → それを前提にする項目もオフ */
+document.addEventListener("change", e => {
+  const el = e.target.closest && e.target.closest("[data-perm]"); if (!el) return;
+  const [r, k] = el.dataset.perm.split("|"); const box = key => document.getElementById(`pm-${r}-${key}`);
+  const on = key => { (PERM_DEPS[key] || []).forEach(d => { const b = box(d); if (b && !b.checked) { b.checked = true; on(d); } }); };
+  const off = key => { Object.entries(PERM_DEPS).forEach(([x, deps]) => { if (deps.includes(key)) { const b = box(x); if (b && b.checked) { b.checked = false; off(x); } } }); };
+  el.checked ? on(k) : off(k); markDirty();
+});
 function vSettings() {
   const c = cfg();
   const list = (key, items, label) => `<section class="panel"><h3>${label}</h3><div class="listedit" data-list="${key}">${items.map((x, i) => rowHTML(key, i, x, label)).join("")}</div><button class="link" type="button" data-add="${key}" style="margin-top:8px">＋ 追加</button></section>`;
@@ -910,6 +988,7 @@ function vSettings() {
         <div class="field full"><label class="checks" style="font-size:.9rem"><input type="checkbox" id="s-issueNotify" ${c.issueNotify === false ? "" : "checked"}>未対応事項が追加されたら、追加した人以外の全員に通知を送る</label><span class="help">追加から5〜15分ほどで届きます。夜23時〜朝7時に追加されたものは、朝7時以降にまとめて送ります</span></div>
         <div class="field full"><span class="lbl">ウェブプッシュ証明書の鍵（初回のみ）</span><input id="s-vapid" value="${esc(c.vapidKey || "")}" placeholder="Firebase →プロジェクトの設定 → Cloud Messaging →ウェブプッシュ証明書の「鍵ペア」"><span class="help">${c.vapidKey ? "設定済みです" : "未設定です。設定するまでメンバーは通知を受け取る登録ができません"}</span></div>
       </div></section>
+    ${permTable()}
     <div class="grid2">${list("routines", c.routines, "定例業務（業務登録の選択肢）")}${list("expenseCats", c.expenseCats, "支出カテゴリ")}${list("incomeCats", c.incomeCats, "収入カテゴリ")}${list("methods", c.methods, "支払方法")}</div>`;
 }
 
@@ -1028,7 +1107,7 @@ function sheetContent(sh) {
     const list = S.tasks.filter(t => t.date === sh.d && (S.onlyMine ? (isMine(t) || (t.shareWith || []).includes(uid()) || t.createdBy === uid()) : relevant(t))).sort(sortTasks);
     return { title: md(sh.d) + (sh.d === TODAY ? "　今日" : ""),
       body: list.length ? list.map(t => taskItem(t)).join("") : `<p class="muted" style="margin:0">この日の業務はありません。</p>`,
-      foot: canWrite() ? `<div class="sp"><button class="btn" type="button" data-act="task-new" data-d="${sh.d}">この日に業務を登録</button></div>` : "" };
+      foot: can("cal_add") ? `<div class="sp"><button class="btn" type="button" data-act="task-new" data-d="${sh.d}">この日に業務を登録</button></div>` : "" };
   }
   if (sh.kind === "month") {
     const cur = S[sh.key]; const y = sh.y;
@@ -1048,7 +1127,7 @@ function sheetContent(sh) {
     if (isTrack(k)) { const t = trackInfo(k); head = `<div class="kd-big"><b>${t.last ? num(t.last.v) : "—"}</b>${Number(k.target) > 0 ? ` / ${num(k.target)}` : ""}${esc(k.unit || "")} ${t.last ? deltaTag(t, k.unit) : ""}</div>`; }
     else { const st = kpiStatus(k); head = `<div class="kd-big"><b>${num(st.a.v)}</b> / ${st.t > 0 ? num(st.t) : "—"}${esc(k.unit || "")} ${st.t > 0 ? `<span class="pill ${st.st.c}">${Math.round(st.rate * 100)}%</span>` : ""}</div>
       ${st.t > 0 ? `<div class="meter"><i class="${st.st.c === "good" ? "good" : (st.st.c === "warn" || st.st.c === "bad") ? "warn" : ""}" style="width:${Math.min(100, st.rate * 100)}%"></i></div>` : ""}`; }
-    const canIn = canManage() || (k.owner === uid() && canWrite());
+    const canIn = can("kpi_manage") || (k.owner === uid() && can("kpi_input"));
     return { title: k.name, body: `${head}
       <div class="kd-meta"><span>担当：${whoTag(k.owner)}</span><span>${isTrack(k) ? "記録のみ（最新値）" : k.mode === "latest" ? "最新値で集計" : "MTG・月末ごとの合計"}</span></div>
       <div class="kd-list">${rows}</div>`,
@@ -1311,8 +1390,8 @@ function wireMultiDate(initial) {
 }
 
 /* ===== 未対応事項：日付のない「やらなきゃいけないこと」を全員で共有 ===== */
-const canEditIssue = i => canManage() || (i.createdBy === uid() && canWrite());
-const canToggleIssue = i => canEditIssue(i) || ((i.owners || []).includes(uid()) && canWrite());
+const canEditIssue = i => can("issue_editAll") || (i.createdBy === uid() && can("issue_add"));
+const canToggleIssue = i => canEditIssue(i) || ((i.owners || []).includes(uid()) && can("issue_add"));
 function issueItem(i) {
   const late = i.due && !i.done && i.due < TODAY;
   const owners = (i.owners || []).map(whoTag).join(" ");
@@ -1361,17 +1440,21 @@ function ledDialog(r) {
     fld("日付", `<input type="date" name="date" id="f-date" required value="${esc(v.date)}">`, { req: true }) +
     fld("担当者", memberChips("owner", [v.owner], { multi: false, byName: true, extra: [v.owner] }), { full: true }) + fld("支払方法", sel("method", c.methods, v.method)) +
     fld("精算", sel("settled", ["未精算", "精算済", "対象外"], v.settled), { help: "立替払いは「未精算」、返金したら「精算済」" }) +
-    fld("メモ", `<textarea name="memo" id="f-memo">${esc(v.memo || "")}</textarea>`, { full: true });
+    fld("メモ", `<textarea name="memo" id="f-memo">${esc(v.memo || "")}</textarea>`, { full: true }) +
+    (finEdit() ? `<div class="field full"><label class="checks" style="font-size:.88rem"><input type="checkbox" name="confirmed" id="f-confirmed" value="1" ${r && r.confirmed ? "checked" : ""}>確認済みにする（記録した本人は編集できなくなる）</label></div>` : "") +
+    (r && r.createdBy ? `<p class="muted full" style="grid-column:1/-1;margin:0;font-size:.78rem">記録：${esc(memName(r.createdBy))}${r.updatedBy && r.updatedBy !== r.createdBy ? `・最終更新：${esc(memName(r.updatedBy))}` : ""}</p>` : "");
   openDlg(r ? "収支を編集" : "収支を記録", body, {
     submit: async f => {
       const amt = Number(f.amount); if (!(amt >= 0)) return showErr("金額を数字で入力してください。"), false;
-      const data = { title: f.title.trim(), type: f.type, category: f.category, amount: amt, date: f.date, owner: f.owner || "", method: f.method, settled: f.settled, memo: f.memo.trim() };
+      const data = { title: f.title.trim(), type: f.type, category: f.category, amount: amt, date: f.date, owner: f.owner || "", method: f.method, settled: f.settled, memo: f.memo.trim(), updatedBy: uid(), updatedAt: serverTimestamp() };
+      if (finEdit()) data.confirmed = !!f.confirmed;
+      if (!data.title) return showErr("項目を入力してください。"), false;
       if (r) await updateDoc(doc(db, "ledger", r.id), data);
-      else { data.createdAt = serverTimestamp(); await addDoc(collection(db, "ledger"), data); memSet("last_led", { type: data.type, category: data.category, owner: data.owner, method: data.method, settled: data.settled }); }
+      else { Object.assign(data, { createdBy: uid(), createdAt: serverTimestamp() }); if (!finEdit()) data.confirmed = false; await addDoc(collection(db, "ledger"), data); memSet("last_led", { type: data.type, category: data.category, owner: data.owner, method: data.method, settled: data.settled }); }
       S.moneyMonth = f.date.slice(0, 7);
     },
-    del: r ? () => deleteDoc(doc(db, "ledger", r.id)) : null,
-    draft: r ? null : "led"
+    del: r && canEditLed(r) ? () => deleteDoc(doc(db, "ledger", r.id)) : null,
+    draft: null   // 収支は端末に下書きを残さない
   });
   const ty = form.querySelector("#f-type"), ca = form.querySelector("#f-category");
   ty.addEventListener("change", () => { const keep = ca.value; ca.innerHTML = catList(ty.value).map(o => `<option${o === keep ? " selected" : ""}>${esc(o)}</option>`).join(""); });
@@ -1407,7 +1490,7 @@ function importDialog() {
       if (ix("項目") < 0 || ix("金額") < 0 || ix("日付") < 0 || ix("区分") < 0) return showErr("「項目」「区分」「金額」「日付」の列が見つかりません。"), false;
       const items = rows.slice(1).map(r => {
         const g = n => ix(n) < 0 ? "" : (r[ix(n)] || "").trim();
-        return { title: g("項目"), type: g("区分") === "収入" ? "収入" : "支出", category: g("カテゴリ") || "その他", amount: Number(g("金額").replace(/[¥￥,円\s]/g, "")) || 0, date: normDate(g("日付")), owner: g("担当者"), method: g("支払方法"), settled: g("精算") || "対象外", memo: g("メモ"), createdAt: serverTimestamp() };
+        return { title: g("項目"), type: g("区分") === "収入" ? "収入" : "支出", category: g("カテゴリ") || "その他", amount: Number(g("金額").replace(/[¥￥,円\s]/g, "")) || 0, date: normDate(g("日付")), owner: g("担当者"), method: g("支払方法"), settled: g("精算") || "対象外", memo: g("メモ"), createdBy: uid(), createdAt: serverTimestamp(), confirmed: true };
       }).filter(x => x.title && x.date);
       if (!items.length) return showErr("取り込める行がありませんでした。日付の形式を確認してください。"), false;
       const keyOf = x => [x.date, x.title, Number(x.amount), x.type].join("|");
@@ -1456,23 +1539,23 @@ document.addEventListener("click", async e => {
     try { const b = writeBatch(db); prev.forEach(k => b.set(doc(collection(db, "kpis")), { name: k.name, track: isTrack(k), target: k.target ?? null, unit: k.unit || "", mode: k.mode, owner: k.owner, viewers: k.viewers || ["all"], month: S.kpiMonth, weekly: {}, order: k.order || Date.now(), createdAt: serverTimestamp() })); await b.commit(); toast("先月のKPIを引き継ぎました"); } catch (err) { toast(errMsg(err), "error"); }
     return;
   }
-  if (act === "task-new") { if (!canWrite()) return; return taskDialog(null, a.dataset.d); }
+  if (act === "task-new") { if (!can("cal_add")) return; return taskDialog(null, a.dataset.d); }
   if (act === "task-open") return taskDialog(S.tasks.find(t => t.id === id));
   if (act === "day") { S.selDay = a.dataset.d; render();
     if (window.matchMedia && matchMedia("(max-width:860px)").matches) openSheet({ kind: "day", d: a.dataset.d }); else { S.pulse = ".day-panel"; render(); }
     return; }
-  if (act === "led-new") return ledDialog(null);
-  if (act === "led-edit") return ledDialog(S.ledger.find(r => r.id === id));
-  if (act === "led-import") return importDialog();
+  if (act === "led-edit") { const r = S.ledger.find(x => x.id === id); if (r && canEditLed(r)) ledDialog(r); return; }
+  if (act === "led-new") { if (finAdd()) ledDialog(null); return; }
+  if (act === "led-import") { if (finEdit()) importDialog(); return; }
   if (act === "inv-new") return inviteDialog();
-  if (act === "issue-new") { if (canWrite()) issueDialog(null); return; }
+  if (act === "issue-new") { if (can("issue_add")) issueDialog(null); return; }
   if (act === "issue-open") return issueDialog((S.issues || []).find(i => i.id === id));
   if (act === "issue-showdone") { S.showDoneIssues = !S.showDoneIssues; render(); return; }
-  if (act === "tpl-new") { if (canWrite()) tplDialog(null); return; }
+  if (act === "tpl-new") { if (can("tpl_add")) tplDialog(null); return; }
   if (act === "tpl-edit") { const tp = (S.templates || []).find(x => x.id === id); if (tp) tplDialog(tp); return; }
   if (act === "tpl-copy") { const tp = (S.templates || []).find(x => x.id === id); if (tp) copyPlain(tp.body, "「" + tp.title + "」をコピーしました"); return; }
   if (act === "tpl-cat") { S.tplCat = a.dataset.v; render(); return; }
-  if (act === "min-new") { if (canWrite()) minuteDialog(); return; }
+  if (act === "min-new") { if (can("min_add")) minuteDialog(); return; }
   if (act === "min-open") { S.minId = id; S.anim = "l"; render(); window.scrollTo(0, 0); return; }
   if (act === "min-back") { S.minId = null; S.anim = "r"; render(); return; }
   if (act === "min-edit") { const m = (S.minutes || []).find(x => x.id === id); if (m) minuteEditDialog(m); return; }
@@ -1511,10 +1594,11 @@ document.addEventListener("click", async e => {
     const out = {}; ["routines", "expenseCats", "incomeCats", "methods"].forEach(k => { out[k] = [...document.querySelectorAll(`[data-list="${k}"] input`)].map(i => i.value.trim()).filter(Boolean); });
     const nt = document.getElementById("s-notifyTime"), ne = document.getElementById("s-notifyEnabled"), vk = document.getElementById("s-vapid"), ni = document.getElementById("s-issueNotify");
     if (nt) out.notifyTime = nt.value; if (ne) out.notifyEnabled = ne.checked; if (ni) out.issueNotify = ni.checked; if (vk) out.vapidKey = vk.value.trim();
-    try { await setDoc(doc(db, "config", "main"), out, { merge: true }); S.settingsDirty = false; toast("設定を保存しました"); render(); } catch (err) { toast(errMsg(err), "error"); }
+    const perms = document.querySelector("[data-perm]") ? readPermTable() : null;
+    try { await setDoc(doc(db, "config", "main"), out, { merge: true }); if (perms) await setDoc(doc(db, "config", "perms"), perms); S.settingsDirty = false; toast("設定を保存しました"); render(); } catch (err) { toast(errMsg(err), "error"); }
   }
 });
-document.addEventListener("keydown", e => { if (e.key === "Enter") { const r = e.target.closest && e.target.closest("tr[data-act=led-edit]"); if (r) ledDialog(S.ledger.find(x => x.id === r.dataset.id)); } });
+document.addEventListener("keydown", e => { if (e.key === "Enter") { const r = e.target.closest && e.target.closest("tr[data-act=led-edit]"); if (r) { const x = S.ledger.find(y => y.id === r.dataset.id); if (x && canEditLed(x)) ledDialog(x); } } });
 document.addEventListener("change", async e => {
   const a = e.target.closest("[data-act]"); if (!a || (a.closest("dialog") && !a.closest("form.is-sheet"))) return;
   const act = a.dataset.act, id = a.dataset.id;
@@ -1539,7 +1623,6 @@ document.addEventListener("change", async e => {
     if (act === "kpi-cell") { const raw = a.value.trim(); await updateDoc(doc(db, "kpis", id), new FieldPath("weekly", a.dataset.wk), { value: raw === "" ? null : Number(raw), by: uid() }); toast("保存しました"); }
     if (act === "mem-name") { await updateDoc(doc(db, "members", id), { name: a.value.trim() }); toast("表示名を保存しました"); }
     if (act === "mem-role") { await updateDoc(doc(db, "members", id), { role: a.value }); toast(memName(id) + "さんを「" + roleLabel(a.value) + "」にしました"); }
-    if (act === "mem-fin") { await updateDoc(doc(db, "members", id), { finance: a.checked }); toast(a.checked ? "収支を見られるようにしました" : "収支を見られないようにしました"); }
   } catch (err) { if (a.type === "checkbox") a.checked = !a.checked; toast(errMsg(err), "error"); }
 });
 

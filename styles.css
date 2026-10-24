@@ -746,3 +746,18 @@ dialog{overflow-x:hidden}
 .seg .badge{display:inline-block;padding:0 7px;border-radius:999px;background:var(--bad);color:#fff;box-shadow:none;font-size:.72rem;line-height:1.7}
 /* 左メニューの見出し：アプリ名を1行に収める */
 .drawer-head b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:.98rem;min-width:0}
+
+/* ===== 権限の表 ===== */
+.perm-table{font-size:.85rem}
+.perm-table th,.perm-table td{white-space:normal}
+.perm-table thead th{position:sticky;top:0;z-index:1}
+.perm-table .pt-cell{text-align:center;width:5.2em;padding:6px 4px}
+.perm-table .pt-cell input{width:18px;height:18px;accent-color:var(--accent);cursor:pointer}
+.perm-table .pt-label{min-width:12em;line-height:1.5}
+.perm-table tr.pt-group th{background:var(--accent-soft);color:var(--navy);font-size:.8rem;letter-spacing:.04em}
+@media (max-width:600px){
+  .perm-table{font-size:.8rem}
+  .perm-table .pt-cell{width:3.6em;padding:6px 2px;font-size:.72rem}
+  .perm-table .pt-label{min-width:0;padding-right:4px}
+}
+@media (min-width:601px){.perm-table thead .pt-cell{white-space:nowrap;width:6em}}
