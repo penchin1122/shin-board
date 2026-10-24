@@ -1,0 +1,165 @@
+rules_version = '2';
+
+// SHIN 運営ボード — Firestore セキュリティルール
+// ここが「誰が何を見られて、何を編集できるか」を実際に決めています。
+// 管理者アドレスは config.js の ADMIN_EMAILS と同じものにしてください。
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email.lower() in ['akira.sato@shincareer.com'];
+    }
+    function myDoc() { return get(/databases/$(database)/documents/members/$(request.auth.uid)); }
+    function isMember() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/members/$(request.auth.uid))
+        && myDoc().data.status == 'active';
+    }
+    // 権限の段階：sub＝副管理者／member＝メンバー（既定）／viewer＝閲覧のみ
+    function myRole() { return myDoc().data.get('role', 'member'); }
+    function isSub() { return isMember() && myRole() == 'sub'; }
+    function canManage() { return isAdmin() || isSub(); }
+    function canWrite() { return isAdmin() || (isMember() && myRole() != 'viewer'); }
+    function validRole(d) { return !('role' in d) || d.role in ['sub', 'member', 'viewer']; }
+    function canFinance() { return isAdmin() || (isMember() && myDoc().data.finance == true); }
+    function changedOnly(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+
+    // メンバー名簿：ログインした本人が「承認待ち」で自分を登録できる。承認・名前・収支閲覧の変更は管理者だけ
+    // 管理者が先に追加した人（招待）：本人のGoogleアドレスと一致したときだけ使える
+    function myEmail() { return request.auth.token.email.lower(); }
+    function invited() {
+      return signedIn() && request.auth.token.email_verified == true
+        && exists(/databases/$(database)/documents/invites/$(myEmail()));
+    }
+    function invite() { return get(/databases/$(database)/documents/invites/$(myEmail())).data; }
+
+    match /invites/{email} {
+      allow read: if isAdmin() || (signedIn() && request.auth.token.email_verified == true && myEmail() == email);
+      allow create, update: if isAdmin() && validRole(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /members/{uid} {
+      allow read: if isAdmin() || isMember() || (signedIn() && request.auth.uid == uid);
+      allow create: if isAdmin() || (
+        signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name', 'email', 'status', 'finance', 'createdAt', 'color', 'role'])
+        && (
+          // 招待なし：承認待ちで登録（収支は見られない）
+          (request.resource.data.status == 'pending' && request.resource.data.finance == false
+            && !('color' in request.resource.data) && !('role' in request.resource.data))
+          // 招待あり：管理者が決めた表示名・色・収支閲覧のまま、すぐ利用開始
+          || (invited() && request.resource.data.status == 'active'
+            && request.resource.data.name == invite().name
+            && request.resource.data.finance == invite().finance
+            && request.resource.data.get('color', null) == invite().get('color', null)
+            && request.resource.data.get('role', 'member') == invite().get('role', 'member'))
+        )
+      );
+      // 本人は「最終利用日時」だけ書き込める（アプリを開いたときに自動で記録）
+      allow update: if (isAdmin() && validRole(request.resource.data))
+        || (isMember() && request.auth.uid == uid && changedOnly(['lastSeen']));
+      allow delete: if isAdmin();
+    }
+
+    // 通知の登録（端末ごとのトークン）：本人だけが読み書きできる。送信処理は管理用の鍵で読む
+    match /members/{uid}/tokens/{tid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+    }
+
+    // 設定（定例業務・カテゴリ）：メンバーは読むだけ
+    match /config/{id} {
+      allow read: if isAdmin() || isMember();
+      allow write: if isAdmin();
+    }
+
+    // 業務カレンダー：全員が見られる。登録は閲覧のみ以外。編集・削除は登録した本人と管理者・副管理者。
+    // 担当者（複数可・登録者以外）は「完了」チェックだけ切り替えられる
+    match /tasks/{id} {
+      allow read: if isAdmin() || isMember();
+      allow create: if canWrite()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.date is string
+        && request.resource.data.owner is string;
+      allow update: if canManage()
+        || (canWrite() && resource.data.createdBy == request.auth.uid
+            && request.resource.data.createdBy == resource.data.createdBy)
+        || (canWrite() && (resource.data.owner == request.auth.uid
+            || ('owners' in resource.data && request.auth.uid in resource.data.owners)) && changedOnly(['done']));
+      allow delete: if canManage() || (canWrite() && resource.data.createdBy == request.auth.uid);
+    }
+
+    // KPI：設定・編集は管理者と副管理者。見られるのは viewers に入っている人（'all' なら全員）と担当者。
+    // 担当者（閲覧のみ以外）はMTG・月末ごとの進捗（weekly）だけ書き込める
+    match /kpis/{id} {
+      allow read: if canManage() || (isMember() && (
+        'all' in resource.data.viewers
+        || request.auth.uid in resource.data.viewers
+        || resource.data.owner == request.auth.uid
+      ));
+      allow create, delete: if canManage();
+      allow update: if canManage()
+        || (canWrite() && resource.data.owner == request.auth.uid && changedOnly(['weekly']));
+    }
+
+    // フォーム（外部に送るGoogleフォームのリンク集）：全員が見られる。追加・編集は管理者と副管理者
+    match /forms/{id} {
+      allow read: if isAdmin() || isMember();
+      allow write: if canManage();
+    }
+
+    // 未対応事項：全員が見られる。追加は閲覧のみ以外。編集・削除は追加した本人と管理者・副管理者。
+    // 担当者は「完了」だけ切り替えられる
+    match /issues/{id} {
+      allow read: if isAdmin() || isMember();
+      allow create: if canWrite() && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.title is string;
+      allow update: if canManage()
+        || (canWrite() && resource.data.createdBy == request.auth.uid
+            && request.resource.data.createdBy == resource.data.createdBy)
+        || (canWrite() && request.auth.uid in resource.data.get('owners', [])
+            && changedOnly(['done', 'doneAt', 'doneBy']));
+      allow delete: if canManage() || (canWrite() && resource.data.createdBy == request.auth.uid);
+    }
+
+    // 議事録：全員が見られる。追加は閲覧のみ以外（「まとめ待ち」で登録）。編集・削除は追加した本人と管理者・副管理者。
+    // ほかのメンバーは「やること」を未対応事項に追加した印（todos）だけ書き込める。要約の書き込みはGitHubの自動実行（管理用の鍵）が行う
+    match /minutes/{id} {
+      allow read: if isAdmin() || isMember();
+      allow create: if canWrite()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.transcript is string
+        && request.resource.data.transcript.size() <= 200000;
+      allow update: if canManage()
+        || (canWrite() && resource.data.createdBy == request.auth.uid
+            && request.resource.data.createdBy == resource.data.createdBy)
+        || (canWrite() && changedOnly(['todos']));
+      allow delete: if canManage() || (canWrite() && resource.data.createdBy == request.auth.uid);
+    }
+
+    // テンプレ一覧：全員が見られる。追加は閲覧のみ以外。編集・削除は追加した本人と管理者・副管理者
+    match /templates/{id} {
+      allow read: if isAdmin() || isMember();
+      allow create: if canWrite() && request.resource.data.createdBy == request.auth.uid;
+      allow update: if canManage() || (canWrite() && resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdBy == resource.data.createdBy);
+      allow delete: if canManage() || (canWrite() && resource.data.createdBy == request.auth.uid);
+    }
+
+    // 収支：見られるのは管理者と「収支の閲覧」をONにした人。編集は管理者だけ
+    match /ledger/{id} {
+      allow read: if canFinance();
+      allow write: if isAdmin();
+    }
+
+    // それ以外はすべて拒否
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
