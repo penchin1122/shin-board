@@ -1,0 +1,47 @@
+name: 通知と議事録
+
+on:
+  schedule:
+    # 5分ごと（終日）。実際にはGitHub側で間引かれるため、cron-job.org から10分ごとに workflow_dispatch で起動する。
+    # 議事録のまとめもこの中で行う。朝の通知は設定タブの時刻を過ぎた最初の回で1日1回だけ、
+    # 未対応事項の通知は追加されたものがあるときだけ送る（夜23時〜朝7時は朝まで待つ）
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "管理者の端末にだけテスト通知を送る（テストのときだけチェック）"
+        type: boolean
+        default: false
+      force:
+        description: "時刻に関係なく、今日の担当者全員に今すぐ送る"
+        type: boolean
+        default: false
+      dry_run:
+        description: "実際には送らず、送る内容だけ表示する"
+        type: boolean
+        default: false
+
+# 外部（cron-job.org）からの実行と定期実行が重なっても、1つずつ順番に動かす（二重送信を防ぐ）
+concurrency:
+  group: notify
+  cancel-in-progress: false
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install --no-save --no-audit --no-fund firebase-admin@12
+      - run: node send.mjs
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+          ADMIN_EMAIL: akira.sato@shincareer.com
+          SITE_URL: https://penchin1122.github.io/shin-board/
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
