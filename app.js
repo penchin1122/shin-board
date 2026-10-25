@@ -983,9 +983,10 @@ function vSettings() {
     <p class="muted" style="font-size:.82rem;margin:-8px 0 14px">左の点のつまみをドラッグすると並び順を変えられます（キーボードではつまみを選んで↑↓キー）。この順番で業務登録や収支の選択肢に表示されます。</p>
     <section class="panel" style="margin-bottom:16px"><h3>通知</h3>
       <div class="dlg-b" style="padding:0">
-        <div class="field"><label class="checks" style="font-size:.9rem"><input type="checkbox" id="s-notifyEnabled" ${c.notifyEnabled === false ? "" : "checked"}>担当業務がある日の朝に通知を送る</label></div>
-        <div class="field"><span class="lbl">送る時間</span>${notifyTimeSelect(c.notifyTime || "07:30")}<span class="help">実際に届くのは、この時刻から10分ほど遅れることがあります</span></div>
-        <div class="field full"><label class="checks" style="font-size:.9rem"><input type="checkbox" id="s-issueNotify" ${c.issueNotify === false ? "" : "checked"}>未対応事項が追加されたら、追加した人以外の全員に通知を送る</label><span class="help">追加から5〜15分ほどで届きます。夜23時〜朝7時に追加されたものは、朝7時以降にまとめて送ります</span></div>
+        <p class="muted full" style="grid-column:1/-1;margin:0;font-size:.8rem">受け取るかどうか・時刻・タイムゾーンは、各自が右上のベルから設定します。ここは全体でのオン・オフと、まだ自分で設定していない人の初期値です。</p>
+        <div class="field"><label class="checks" style="font-size:.9rem"><input type="checkbox" id="s-notifyEnabled" ${c.notifyEnabled === false ? "" : "checked"}>朝の通知（担当業務がある日）を使う</label></div>
+        <div class="field"><span class="lbl">初期の時刻（日本時間）</span>${notifyTimeSelect(c.notifyTime || "07:30")}<span class="help">自分で時刻を設定していない人に使います</span></div>
+        <div class="field full"><label class="checks" style="font-size:.9rem"><input type="checkbox" id="s-issueNotify" ${c.issueNotify === false ? "" : "checked"}>未対応事項が追加されたときの通知を使う</label><span class="help">追加した人以外に送ります。各自が決めた夜間の時間帯には送らず、明けてから届きます</span></div>
         <div class="field full"><span class="lbl">ウェブプッシュ証明書の鍵（初回のみ）</span><input id="s-vapid" value="${esc(c.vapidKey || "")}" placeholder="Firebase →プロジェクトの設定 → Cloud Messaging →ウェブプッシュ証明書の「鍵ペア」"><span class="help">${c.vapidKey ? "設定済みです" : "未設定です。設定するまでメンバーは通知を受け取る登録ができません"}</span></div>
       </div></section>
     ${permTable()}
@@ -1021,20 +1022,50 @@ function bindForeground() {
   if (fgBound || !fbApp) return; fgBound = true;
   try { onMessage(getMessaging(fbApp), p => { const n = p.notification || {}; toast((n.title ? n.title + "：" : "") + (n.body || ""), "info", { duration: 6000 }); }); } catch (e) { }
 }
+/* ===== 通知の個人設定（時差のある人のために、時刻とタイムゾーンを各自で決める） ===== */
+const TZS = [["Asia/Tokyo", "日本"], ["Asia/Seoul", "韓国"], ["Asia/Shanghai", "中国"], ["Asia/Taipei", "台湾"], ["Asia/Singapore", "シンガポール"], ["Asia/Bangkok", "タイ"], ["Australia/Sydney", "オーストラリア東部"], ["Europe/London", "イギリス"], ["Europe/Paris", "ヨーロッパ中部（フランス・ドイツなど）"], ["America/New_York", "アメリカ東部（ボストン・ニューヨーク）"], ["America/Chicago", "アメリカ中部"], ["America/Denver", "アメリカ山岳部"], ["America/Los_Angeles", "アメリカ西部（カリフォルニア）"], ["America/Toronto", "カナダ東部"], ["America/Vancouver", "カナダ西部"], ["Pacific/Honolulu", "ハワイ"]];
+const browserTz = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Tokyo"; } catch (e) { return "Asia/Tokyo"; } };
+const tzNow = tz => { try { return new Intl.DateTimeFormat("ja-JP", { timeZone: tz, month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date()); } catch (e) { return ""; } };
+function myNotify() {
+  const c = cfg(); const n = (S.member && S.member.notify) || {};
+  return { morning: n.morning !== false, time: n.time || c.notifyTime || "07:30", tz: n.tz || "Asia/Tokyo", issues: n.issues !== false, minutes: n.minutes !== false, quietStart: n.quietStart || "23:00", quietEnd: n.quietEnd || "07:00", saved: !!S.member && !!S.member.notify };
+}
+const timeOpts = (from, to, step, cur) => { const o = []; for (let m = from * 60; m <= to * 60; m += step) o.push(pad(Math.floor(m / 60) % 24) + ":" + pad(m % 60)); return o.map(x => `<option ${x === cur ? "selected" : ""}>${x}</option>`).join(""); };
 function notifyDialog() {
-  const c = cfg(); const on = notifyOn();
+  const c = cfg(); const on = notifyOn(); const n = myNotify();
   const perm = typeof Notification === "undefined" ? "unsupported" : Notification.permission;
+  const tzList = TZS.some(([z]) => z === n.tz) ? TZS : [[n.tz, n.tz], ...TZS];
+  const bt = browserTz(); const tzHint = bt !== n.tz ? `<span class="help">この端末の時刻は「${esc(bt)}」です。<button class="link" type="button" id="n-tz-here">この端末のタイムゾーンにする</button></span>` : "";
   const iosNote = isIOS() && !isStandalone() ? `<p class="banner" style="grid-column:1/-1;margin:0">iPhoneで通知を受け取るには、Safariの共有ボタン →「ホーム画面に追加」で追加したアプリから開いて、ここで登録してください。</p>` : "";
-  const body = iosNote + `<div class="field full"><span class="lbl">この端末の状態</span><div class="ro">${on ? `<span class="pill good">通知を受け取ります</span>` : perm === "denied" ? `<span class="pill bad">通知がブロックされています</span>` : `<span class="pill plain">受け取っていません</span>`}</div>
-    <span class="help">${c.notifyEnabled === false ? "現在、管理者が朝の通知を止めています。" : `自分が担当の業務がある日の朝${esc(c.notifyTime || "07:30")}ごろに届きます。`}${c.issueNotify === false ? "" : "未対応事項が追加されたときにも届きます。"}端末ごとに登録が必要です（スマホとPCの両方で受け取るなら両方で登録）。</span>
-    ${perm === "denied" ? `<span class="help">端末の設定（iPhoneは「設定」→「通知」→「SHIN」）で許可してから、もう一度押してください。</span>` : ""}</div>`;
+  const body = iosNote + `<div class="field full"><span class="lbl">この端末</span><div class="ro">${on ? `<span class="pill good">通知を受け取ります</span>` : perm === "denied" ? `<span class="pill bad">通知がブロックされています</span>` : `<span class="pill plain">受け取っていません</span>`}
+      ${on ? `<button class="link" type="button" id="n-off" style="margin-left:10px">この端末で受け取らない</button>` : `<button class="btn small" type="button" id="n-on" style="margin-left:10px">この端末で受け取る</button>`}</div>
+      <span class="help">端末ごとに登録が必要です（スマホとPCの両方で受け取るなら両方で）。下の設定は、登録したすべての端末に共通です。</span>
+      ${perm === "denied" ? `<span class="help">端末の設定（iPhoneは「設定」→「通知」→「SHIN」）で許可してから、もう一度押してください。</span>` : ""}</div>
+    <div class="field full nt-sec"><span class="lbl">受け取る通知</span>
+      <label class="checks"><input type="checkbox" name="morning" id="n-morning" value="1" ${n.morning ? "checked" : ""}>朝の通知（自分が担当の業務がある日）${c.notifyEnabled === false ? `<span class="pill plain" style="margin-left:6px">管理者が停止中</span>` : ""}</label>
+      <label class="checks"><input type="checkbox" name="issues" id="n-issues" value="1" ${n.issues ? "checked" : ""}>未対応事項が追加されたとき${c.issueNotify === false ? `<span class="pill plain" style="margin-left:6px">管理者が停止中</span>` : ""}</label>
+      <label class="checks"><input type="checkbox" name="minutes" id="n-minutes" value="1" ${n.minutes ? "checked" : ""}>自分が追加した議事録がまとまったとき</label></div>
+    <div class="field full"><span class="lbl">タイムゾーン</span><select name="tz" id="n-tz">${tzList.map(([z, l]) => `<option value="${esc(z)}" ${z === n.tz ? "selected" : ""}>${esc(l)}（いま ${esc(tzNow(z))}）</option>`).join("")}</select>${tzHint}
+      <span class="help">朝の通知の時刻と夜間の時間帯は、このタイムゾーンで判断します。業務の時刻も、この地域の時刻に直して届きます。</span></div>
+    <div class="field"><span class="lbl">朝の通知の時刻</span><select name="time" id="n-time">${timeOpts(4, 12, 15, n.time)}</select></div>
+    <div class="field"><span class="lbl">夜間は送らない</span><div class="nt-quiet"><select name="quietStart" id="n-qs" aria-label="夜間の開始">${timeOpts(19, 26, 30, n.quietStart)}</select><span>〜</span><select name="quietEnd" id="n-qe" aria-label="夜間の終わり">${timeOpts(4, 10, 30, n.quietEnd)}</select></div></div>
+    <p class="muted full" style="grid-column:1/-1;margin:0;font-size:.78rem">夜間に追加された未対応事項は、夜間が明けてからまとめて届きます。実際に届くのは、設定した時刻から10分ほど遅れることがあります。</p>`;
   form.innerHTML = `<div class="dlg-h"><h3>通知</h3><button type="button" data-close aria-label="閉じる">×</button></div><div class="dlg-b">${body}<p class="err" id="f-err" hidden></p></div>
-    <div class="dlg-f"><div class="sp">${on ? `<button class="btn sec" type="button" id="n-off">この端末で受け取らない</button>` : `<button class="btn" type="button" id="n-on">この端末で受け取る</button>`}</div></div>`;
-  onSubmit = null; onDelete = null; draftKey = null;
+    <div class="dlg-f"><div class="sp"><button class="btn sec" type="button" data-close>閉じる</button><button class="btn" type="button" id="n-save">設定を保存</button></div></div>`;
+  onSubmit = null; onDelete = null; draftKey = null; form.classList.remove("is-sheet"); S.sheet = null;
   showDlg();
-  const onB = form.querySelector("#n-on"), offB = form.querySelector("#n-off");
-  if (onB) onB.addEventListener("click", async () => { onB.disabled = true; onB.textContent = "登録しています…"; try { await enablePush(); closeDlg(); toast("この端末で通知を受け取ります"); render(); } catch (e) { showErr(e.message || errMsg(e)); onB.disabled = false; onB.textContent = "この端末で受け取る"; } });
-  if (offB) offB.addEventListener("click", async () => { offB.disabled = true; await disablePush(); closeDlg(); toast("この端末への通知を止めました", "info"); render(); });
+  const onB = form.querySelector("#n-on"), offB = form.querySelector("#n-off"), here = form.querySelector("#n-tz-here");
+  if (onB) onB.addEventListener("click", async () => { onB.disabled = true; onB.textContent = "登録しています…"; try { await enablePush(); toast("この端末で通知を受け取ります"); if (!myNotify().saved) await saveNotify(true); notifyDialog(); render(); } catch (e) { showErr(e.message || errMsg(e)); onB.disabled = false; onB.textContent = "この端末で受け取る"; } });
+  if (offB) offB.addEventListener("click", async () => { offB.disabled = true; await disablePush(); toast("この端末への通知を止めました", "info"); notifyDialog(); render(); });
+  if (here) here.addEventListener("click", () => { const sel = form.querySelector("#n-tz"); if (![...sel.options].some(o => o.value === bt)) sel.insertAdjacentHTML("afterbegin", `<option value="${esc(bt)}">${esc(bt)}（いま ${esc(tzNow(bt))}）</option>`); sel.value = bt; here.parentElement.remove(); });
+  form.querySelector("#n-save").addEventListener("click", async e => { e.currentTarget.disabled = true; try { await saveNotify(false); closeDlg(); toast("通知の設定を保存しました"); } catch (err) { showErr(err); e.currentTarget.disabled = false; } });
+}
+async function saveNotify(quiet) {
+  const g = id => form.querySelector(id);
+  const n = myNotify();
+  const data = g("#n-tz") ? { morning: g("#n-morning").checked, issues: g("#n-issues").checked, minutes: g("#n-minutes").checked, tz: g("#n-tz").value, time: g("#n-time").value, quietStart: g("#n-qs").value, quietEnd: g("#n-qe").value }
+    : { morning: n.morning, issues: n.issues, minutes: n.minutes, tz: quiet ? browserTz() : n.tz, time: n.time, quietStart: n.quietStart, quietEnd: n.quietEnd };
+  await updateDoc(doc(db, "members", uid()), { notify: data });
 }
 
 /* ================= dialogs ================= */

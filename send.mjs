@@ -1,10 +1,11 @@
 // SHIN 運営ボード — 通知を送る処理
-// GitHub Actions から5分ごとに起動され、次の2つを行います。
-//  1. 朝の通知：「設定」タブの時刻を過ぎていて、その日まだ送っていなければ、担当業務がある人に1回だけ送る
-//  2. 未対応事項の通知：まだ通知していない未対応事項があれば、追加した人以外の全員に送る（夜23時〜朝7時は朝まで待つ）
+// cron-job.org → GitHub Actions から10分ごとに起動され、次の3つを行います。
+//  1. 朝の通知：各メンバーが決めたタイムゾーン・時刻を過ぎていて、その人の「今日」にまだ送っていなければ、
+//     その人が担当の業務を、その人の現地時間に直して1回だけ送る
+//  2. 未対応事項の通知：追加した人以外に送る。各メンバーの夜間の時間帯には送らず、明けてから届ける
 //  3. 議事録のまとめ：「まとめ待ち」の議事録があれば、Gemini で要約して書き戻し、追加した人に通知する
 import { initializeApp, cert } from "firebase-admin/app";
-import { getFirestore } from "firebase-admin/firestore";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
 import { getMessaging } from "firebase-admin/messaging";
 
 const SITE_URL = (process.env.SITE_URL || "").replace(/\/?$/, "/");   // notify.yml で指定（例：https://penchin1122.github.io/shin-board/）
@@ -18,27 +19,47 @@ export function jstNow(d = new Date()) {
   const p = n => String(n).padStart(2, "0");
   return { date: `${j.getUTCFullYear()}-${p(j.getUTCMonth() + 1)}-${p(j.getUTCDate())}`, time: `${p(j.getUTCHours())}:${p(j.getUTCMinutes())}` };
 }
-export function shouldSend({ now, notifyTime = "07:30", enabled = true, lastDate, force = false }) {
-  if (force) return true;
-  if (enabled === false) return false;
-  if (lastDate === now.date) return false;
-  return now.time >= notifyTime && now.time < "12:00";
+/* ===== 時刻：業務の日付・時刻は日本時間で登録されている。通知はメンバーごとのタイムゾーンで判断する ===== */
+export function localParts(tz, d = new Date()) {
+  const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz || "Asia/Tokyo", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+  const o = Object.fromEntries(f.formatToParts(d).map(p => [p.type, p.value]));
+  return { date: `${o.year}-${o.month}-${o.day}`, time: `${o.hour === "24" ? "00" : o.hour}:${o.minute}` };
 }
-export function buildMessages(tasks, today) {
+const jstAbs = (date, time) => new Date(`${date}T${time}:00+09:00`);
+export function prefsOf(member, cfg = {}) {
+  const n = member.notify || {};
+  return { morning: n.morning !== false, time: n.time || cfg.notifyTime || "07:30", tz: n.tz || "Asia/Tokyo", issues: n.issues !== false, minutes: n.minutes !== false, quietStart: n.quietStart || "23:00", quietEnd: n.quietEnd || "07:00" };
+}
+export function inQuiet(pref, now = new Date()) {
+  const t = localParts(pref.tz, now).time, a = pref.quietStart, b = pref.quietEnd;
+  if (a === b) return false;
+  return a > b ? (t >= a || t < b) : (t >= a && t < b);
+}
+export function shouldSendMorning({ pref, now = new Date(), lastDate, force = false, enabled = true }) {
+  if (force) return true;
+  if (enabled === false || !pref.morning) return false;
+  const lp = localParts(pref.tz, now);
+  if (lastDate === lp.date) return false;
+  return lp.time >= pref.time && lp.time < "12:00";
+}
+/* その人の「今日」（現地の日付）にある担当業務。時刻のある業務は現地時刻に直して判定、終日の業務は日付で判定 */
+export function buildMorning(tasks, memberId, pref, now = new Date()) {
   const label = t => t.label ? `${t.label}（${t.routine}）` : t.routine && t.routine !== "__other" ? t.routine : (t.detail || "業務");
-  const time = t => !t.start ? "終日" : t.start + (t.end ? "–" + t.end : "〜");
-  const by = {};
   const ownersOf = t => (Array.isArray(t.owners) && t.owners.length ? t.owners : (t.owner ? [t.owner] : []));
-  tasks.filter(t => t.date === today && !t.done).forEach(t => ownersOf(t).forEach(o => (by[o] = by[o] || []).push(t)));
-  return Object.entries(by).map(([owner, list]) => {
-    list.sort((a, b) => (a.start || "").localeCompare(b.start || ""));
-    const body = list.map(t => `${time(t)} ${label(t)}`).join("\n");
-    return { owner, title: `今日の担当業務（${list.length}件）`, body };
-  });
+  const today = localParts(pref.tz, now).date;
+  const list = tasks.filter(t => !t.done && ownersOf(t).includes(memberId)).map(t => {
+    if (!t.start) return t.date === today ? { t, sort: "", time: "終日" } : null;
+    const s = jstAbs(t.date, t.start); const ls = localParts(pref.tz, s);
+    if (ls.date !== today) return null;
+    const le = t.end ? localParts(pref.tz, jstAbs(t.date, t.end)).time : "";
+    return { t, sort: ls.time, time: ls.time + (le ? "–" + le : "〜") };
+  }).filter(Boolean).sort((a, b) => a.sort.localeCompare(b.sort));
+  if (!list.length) return null;
+  const local = pref.tz !== "Asia/Tokyo";
+  return { title: `今日の担当業務（${list.length}件）`, body: list.map(x => `${x.time} ${label(x.t)}`).join("\n") + (local ? "\n※時刻は現地時間" : "") };
 }
 
 export function addDaysStr(d, n) { const x = new Date(d + "T00:00:00Z"); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); }
-export function inQuietHours(now) { return now.time < "07:00" || now.time >= "23:00"; }
 export function buildIssueMessages(issues, members) {
   // members: [{ id, name }]（有効なメンバー）。追加した本人には送らない
   const nameOf = id => (members.find(m => m.id === id) || {}).name || "メンバー";
@@ -73,7 +94,7 @@ async function sendTo(db, fcm, uid, name, title, body, tag) {
   return res.successCount;
 }
 
-async function issueNotify(db, fcm, cfg, now) {
+export async function issueNotify(db, fcm, cfg, members) {
   const snap = await db.collection("issues").where("notified", "==", false).get();
   if (snap.empty) { console.log("未対応事項：新しい追加なし"); return; }
   if (cfg.issueNotify === false) {
@@ -81,15 +102,32 @@ async function issueNotify(db, fcm, cfg, now) {
     if (!DRY) { const b = db.batch(); snap.docs.forEach(d => b.update(d.ref, { notified: true })); await b.commit(); }
     console.log(`未対応事項：${snap.size}件（通知オフのため送らない）`); return;
   }
-  if (inQuietHours(now) && !FORCE) { console.log(`未対応事項：${snap.size}件（夜間のため朝7時以降に送る）`); return; }
-  // 二重送信を防ぐため、先に「通知済み」を記録する
-  if (!DRY) { const b = db.batch(); snap.docs.forEach(d => b.update(d.ref, { notified: true, notifiedAt: new Date().toISOString() })); await b.commit(); }
-  const issues = snap.docs.map(d => d.data()).filter(i => !i.done);
-  const ms = await db.collection("members").where("status", "==", "active").get();
-  const members = ms.docs.map(d => ({ id: d.id, name: d.data().name || d.data().email || d.id }));
-  const msgs = buildIssueMessages(issues, members);
-  console.log(`未対応事項：${issues.length}件 → ${msgs.length}人に送信`);
-  for (const m of msgs) await sendTo(db, fcm, m.owner, (members.find(x => x.id === m.owner) || {}).name, m.title, m.body, "issues");
+  // 受け取る人ごとに、まだ送っていないものだけを、その人の夜間を避けて送る（sentTo に送った人を記録）
+  const items = snap.docs.map(d => ({ ref: d.ref, id: d.id, ...d.data() }));
+  const targets = members.filter(m => prefsOf(m, cfg).issues);
+  const nameOf = id => (members.find(m => m.id === id) || {}).name || "メンバー";
+  const sent = {};
+  for (const m of targets) {
+    if (!FORCE && inQuiet(prefsOf(m, cfg))) continue;
+    const list = items.filter(i => !i.done && i.createdBy !== m.id && !(i.sentTo || []).includes(m.id));
+    if (!list.length) continue;
+    const [msg] = buildIssueMessages(list, [{ id: m.id, name: m.name }].concat(members.filter(x => x.id !== m.id)).map(x => ({ id: x.id, name: x.name }))).filter(x => x.owner === m.id);
+    if (!msg) continue;
+    if (!DRY) { const b = db.batch(); list.forEach(i => { b.update(i.ref, { sentTo: FieldValue.arrayUnion(m.id) }); (sent[i.id] = sent[i.id] || []).push(m.id); }); await b.commit(); }
+    await sendTo(db, fcm, m.id, m.name, msg.title, msg.body, "issues");
+  }
+  // 全員に届け終わったもの（または追加から24時間たったもの）は「通知済み」にする
+  if (!DRY) {
+    const b = db.batch(); let n = 0;
+    for (const i of items) {
+      const got = new Set([...(i.sentTo || []), ...(sent[i.id] || [])]);
+      const need = targets.filter(m => m.id !== i.createdBy).every(m => got.has(m.id));
+      const old = i.createdAt && i.createdAt.toMillis && Date.now() - i.createdAt.toMillis() > 24 * 3600e3;
+      if (i.done || need || old) { b.update(i.ref, { notified: true, notifiedAt: new Date().toISOString() }); n++; }
+    }
+    if (n) await b.commit();
+  }
+  console.log(`未対応事項：${items.length}件を確認`);
 }
 
 /* ===== 議事録のまとめ（Gemini） ===== */
@@ -179,7 +217,7 @@ async function summarizeMinutes(db, fcm) {
       await d.ref.update({ status: "done", error: "", title: m.title || r.title, summary: r.summary, todos: r.todos, model, summarizedAt: new Date().toISOString(), tries: 0 });
       console.log(`議事録：${m.date} をまとめました（${model}・やること${r.todos.length}件）`);
       const who = ms.docs.find(x => x.id === m.createdBy);
-      if (who) await sendTo(db, fcm, who.id, who.data().name || who.id, "議事録をまとめました", `${m.date ? Number(m.date.slice(5, 7)) + "/" + Number(m.date.slice(8, 10)) + " " : ""}${m.title || r.title}\n決定事項${r.summary.decisions.length}件・やること${r.todos.length}件`, "minutes-" + d.id);
+      if (who && prefsOf(who.data()).minutes) await sendTo(db, fcm, who.id, who.data().name || who.id, "議事録をまとめました", `${m.date ? Number(m.date.slice(5, 7)) + "/" + Number(m.date.slice(8, 10)) + " " : ""}${m.title || r.title}\n決定事項${r.summary.decisions.length}件・やること${r.todos.length}件`, "minutes-" + d.id);
     } catch (e) {
       const tries = (m.tries || 0) + 1;
       const retry = !e.permanent && tries < 4;   // 混雑（429など）は次の回でやり直す
@@ -216,22 +254,25 @@ async function main() {
   const cfgRef = db.doc("config/main"), stateRef = db.doc("config/notifyState");
   const [cfgSnap, stateSnap] = await Promise.all([cfgRef.get(), stateRef.get()]);
   const cfg = cfgSnap.exists ? cfgSnap.data() : {};
-  const now = jstNow();
-  const go = shouldSend({ now, notifyTime: cfg.notifyTime || "07:30", enabled: cfg.notifyEnabled, lastDate: stateSnap.exists ? stateSnap.data().lastDate : null, force: FORCE });
-  console.log(`JST ${now.date} ${now.time} / 朝の通知 設定 ${cfg.notifyTime || "07:30"} / 有効 ${cfg.notifyEnabled !== false} / 送信 ${go}`);
-  if (go) {
-    // 二重送信を防ぐため、先に「今日は送った」を記録する（手動テストでは記録しない）
-    if (!FORCE && !DRY) await stateRef.set({ lastDate: now.date, at: new Date().toISOString() }, { merge: true });
-    const tasksSnap = await db.collection("tasks").where("date", "==", now.date).get();
-    const msgs = buildMessages(tasksSnap.docs.map(d => d.data()), now.date);
-    console.log(`今日の担当者 ${msgs.length}人`);
-    for (const m of msgs) {
-      const mem = await db.doc(`members/${m.owner}`).get();
-      if (!mem.exists || mem.data().status !== "active") continue;
-      await sendTo(db, fcm, m.owner, mem.data().name || m.owner, m.title, m.body, "morning");
-    }
+  const sent = (stateSnap.exists && stateSnap.data().morning) || {};
+  const now = new Date(), jst = localParts("Asia/Tokyo", now);
+  const ms = await db.collection("members").where("status", "==", "active").get();
+  const members = ms.docs.map(d => ({ id: d.id, ...d.data(), name: d.data().name || d.data().email || d.id }));
+  console.log(`JST ${jst.date} ${jst.time} / 朝の通知（全体）${cfg.notifyEnabled !== false ? "有効" : "停止中"} / メンバー${members.length}人`);
+  // 時差を考えて、日本時間の前日〜翌日の業務を読む
+  const tasksSnap = await db.collection("tasks").where("date", ">=", addDaysStr(jst.date, -1)).where("date", "<=", addDaysStr(jst.date, 1)).get();
+  const tasks = tasksSnap.docs.map(d => d.data());
+  for (const m of members) {
+    const pref = prefsOf(m, cfg);
+    if (!shouldSendMorning({ pref, now, lastDate: sent[m.id], force: FORCE, enabled: cfg.notifyEnabled })) continue;
+    const today = localParts(pref.tz, now).date;
+    // 二重送信を防ぐため、先に「この人には今日送った」を記録する（手動の今すぐ送信では記録しない）
+    if (!FORCE && !DRY) await stateRef.set({ morning: { [m.id]: today } }, { merge: true });
+    const msg = buildMorning(tasks, m.id, pref, now);
+    if (!msg) { console.log(`- ${m.name}: 今日の担当業務なし（${pref.tz} ${today}）`); continue; }
+    await sendTo(db, fcm, m.id, m.name, msg.title, msg.body, "morning");
   }
-  await issueNotify(db, fcm, cfg, now);
+  await issueNotify(db, fcm, cfg, members);
   await summarizeMinutes(db, fcm);
 }
 

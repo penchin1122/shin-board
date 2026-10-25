@@ -762,3 +762,9 @@ dialog{overflow-x:hidden}
   .perm-table .pt-label{min-width:0;padding-right:4px}
 }
 @media (min-width:601px){.perm-table thead .pt-cell{white-space:nowrap;width:6em}}
+
+/* ===== 通知の個人設定 ===== */
+.nt-sec .checks{margin:2px 0}
+.nt-quiet{display:flex;align-items:center;gap:6px;min-width:0}
+.nt-quiet select{flex:1;min-width:0}
+.field .ro .btn.small{vertical-align:1px}
