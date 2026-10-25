@@ -768,3 +768,9 @@ dialog{overflow-x:hidden}
 .nt-quiet{display:flex;align-items:center;gap:6px;min-width:0}
 .nt-quiet select{flex:1;min-width:0}
 .field .ro .btn.small{vertical-align:1px}
+
+/* ===== 収支の暗号化 ===== */
+.vault-box{max-width:520px;margin:0 auto}
+.vault-box h3 svg{color:var(--accent)}
+.vault-box .field input{font-size:16px}
+.rk{font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;font-size:1.05rem;font-weight:700;letter-spacing:.06em;line-height:1.8;padding:12px 14px;border:1px dashed var(--accent);border-radius:8px;background:var(--accent-soft);color:var(--navy);word-break:break-all;margin:4px 0 8px}

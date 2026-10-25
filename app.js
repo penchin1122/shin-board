@@ -156,7 +156,7 @@ const TAB_PERM = { cal: "cal_view", forms: "forms_view", templates: "tpl_view", 
 const tabsVisible = () => TABS_ALL.filter(([k]) => (k !== "money" || finAdd()) && (k !== "admin" || S.isAdmin) && (!TAB_PERM[k] || can(TAB_PERM[k])));
 
 /* ================= auth & data lifecycle ================= */
-function stopData() { dataUnsubs.forEach(u => u()); dataUnsubs = []; S.ready = {}; S.need = []; S.tasks = []; S.kpis = []; S.ledger = []; S.members = []; S.config = null; }
+function stopData() { dataUnsubs.forEach(u => u()); dataUnsubs = []; S.ready = {}; S.need = []; S.tasks = []; S.kpis = []; S.ledger = []; S.ledgerRaw = []; S.mine = []; S.members = []; S.config = null; S.priv = null; S.decCache = {}; S.vaultPub = null; S.vaultKey = null; S.pendingRecovery = null; }
 function resetAll() { if (memberUnsub) { memberUnsub(); memberUnsub = null; } if (permsUnsub) { permsUnsub(); permsUnsub = null; } stopData(); S.member = null; S.isAdmin = false; S.dataKey = ""; S.perms = null; S.permsReady = false; }
 /* 権限（本人の段階と権限の表）が変わったら、読み込むデータを組み直す */
 function syncData() {
@@ -241,8 +241,14 @@ function startData() {
       listen("kpis" + i, query(collection(db, "kpis"), where(...w)), s => { parts[i] = docsOf(s); merge(); }));
   }
   // 収支：すべて見られる人は全件、追加だけの人は自分が追加した記録だけ（ルール上それ以外は読めない）
-  if (finView()) listen("ledger", collection(db, "ledger"), s => S.ledger = docsOf(s));
-  else if (finAdd()) listen("ledger", query(collection(db, "ledger"), where("createdBy", "==", uid())), s => S.ledger = docsOf(s));
+  if (finAdd()) listen("vaultPub", doc(db, "config", "vaultPub"), s => S.vaultPub = s.exists() ? s.data().pub : null);
+  if (finView()) {
+    listen("vaultKey", doc(db, "vault", "key"), s => S.vaultKey = s.exists() ? s.data() : null);
+    listen("ledger", collection(db, "ledger"), s => { S.ledgerRaw = docsOf(s); decryptLedger(); });
+  } else if (finAdd()) {
+    listen("ledger", query(collection(db, "ledger"), where("createdBy", "==", uid())), s => { S.ledgerRaw = docsOf(s); mergeMine(); });
+    listen("mine", query(collection(db, "ledgerMine"), where("createdBy", "==", uid())), s => { S.mine = docsOf(s); mergeMine(); });
+  }
 }
 
 async function login() {
@@ -433,6 +439,8 @@ function render() {
   if (!S.need.length || !S.need.every(k => S.ready[k])) { if (!main.querySelector(".sk-wrap")) main.innerHTML = skeleton(S.tab); return; }
   const views = { home: vHome, kpi: vKpi, cal: vCal, forms: vForms, money: vMoney, minutes: vMinutes, templates: vTemplates, admin: vAdmin };
   if (S.tab === "admin" && S.adminSub === "settings" && (S.settingsDirty || S.dragging) && main.querySelector("[data-list]")) return;
+  // パスワードを入力している途中は、データが更新されても画面を描き直さない
+  const vp = main.querySelector(".vault-box #v-pass"); if (S.tab === "money" && vp && vp.value) return;
   const prevScroll = window.scrollY;
   const anim = S.anim || (main.querySelector(".sk-wrap") ? "in" : null); S.anim = null;
   main.innerHTML = views[S.tab]();
@@ -493,16 +501,6 @@ function vHome() {
   const untilMtg = daysBetween(TODAY, NEXTMTG);
   const mtgKpis = S.kpis.filter(k => k.month === NEXTMTG.slice(0, 7));
   const myKpiNoReport = untilMtg <= 7 && can("kpi_input") ? mtgKpis.filter(k => k.owner === uid() && !((k.weekly || {})[NEXTMTG] && (k.weekly || {})[NEXTMTG].value !== null)) : [];
-  let fin = "";
-  if (finView()) {
-    const mrows = S.ledger.filter(r => (r.date || "").startsWith(THISMONTH));
-    const inc = sumBy(mrows, "収入"), exp = sumBy(mrows, "支出"), bal = sumBy(S.ledger, "収入") - sumBy(S.ledger, "支出");
-    const uns = S.ledger.filter(r => r.settled === "未精算").sort((a, b) => (a.date || "").localeCompare(b.date || ""));
-    fin = `<section class="panel"><h3>お金<button class="link hint" type="button" data-act="go" data-tab="money">収支を開く</button></h3>
-      <div class="figs" style="margin-bottom:8px"><div class="fig"><div class="k">今月の収支</div><div class="v ${inc - exp >= 0 ? "pos" : "neg"}">${cu(inc - exp, "yen", inc - exp >= 0 ? "+" : "−")}</div></div><div class="fig"><div class="k">現在の残高</div><div class="v">${cu(bal, "yen", bal < 0 ? "−" : "")}</div></div></div>
-      <div class="muted" style="font-size:.8rem;font-weight:700">未精算の立替 ${uns.length}件</div>
-      ${uns.length ? uns.map(r => `<div class="row3"><span>${md(r.date)}</span><span>${esc(r.title)}（${esc(r.owner || "")}）</span><span>${yen(r.amount)}</span></div>`).join("") : `<p class="muted" style="margin:0;font-size:.85rem">ありません。</p>`}</section>`;
-  }
   return `<div class="bar"><h2>${md(TODAY)}</h2><span class="muted">${esc(memName(uid()))}さん</span></div>
   <div class="grid2 home-grid">
     <div class="stack">
@@ -517,13 +515,11 @@ function vHome() {
         ${doneIssues.length ? `<button class="link done-toggle" type="button" data-act="issue-showdone">${S.showDoneIssues ? "完了済みを隠す" : `完了済み ${doneIssues.length}件を表示`}</button>${S.showDoneIssues ? `<div class="done-list">${doneIssues.map(issueItem).join("")}</div>` : ""}` : ""}
       </section>
       ${myLate.length ? `<section class="panel"><h3>自分の未対応<span class="hint">${myLate.length}件</span></h3>${myLate.map(t => taskItem(t, { late: true, showDate: true })).join("")}</section>` : ""}
-      ${fin ? `<div class="fin-l">${fin}</div>` : ""}
     </div>
     <div class="stack">
       <section class="panel"><h3>今月のKPI<button class="link hint" type="button" data-act="go" data-tab="kpi">進捗を入力</button></h3>
         ${ks.length ? ks.map(k => kpiRow(k, false)).join("") : `<p class="muted" style="margin:0">${can("kpi_manage") ? "今月のKPIはまだ設定されていません。" : "表示できる今月のKPIはありません。"}</p>`}
       </section>
-      ${fin ? `<div class="fin-r">${fin}</div>` : ""}
     </div>
   </div>`;
 }
@@ -629,13 +625,169 @@ function bankBalance(asOf) {
   }
   return { bal, pending: list.reduce((a, b) => a + b.amount, 0), pays };
 }
-const canEditLed = r => finEdit() || (r.createdBy === uid() && finAdd() && !r.confirmed);
+/* ===================== 収支の暗号化 =====================
+   ・記録は「書き込み用の鍵（公開鍵）」で暗号化して保存する。メンバーや自動取り込み（Stripe）はこの鍵で書ける
+   ・読むための鍵（秘密鍵）は「閲覧用パスワード」で暗号化して保存し、収支を開くときだけ、この端末の中で元に戻す
+   ・パスワードはサーバーに送らない。忘れたときは、設定時に表示した「復旧キー」で新しいパスワードにできる
+   ・データベースには暗号文しか入らないので、アカウントが乗っ取られても、パスワードがなければ中身は読めない */
+const subtle = () => { if (!(window.crypto && crypto.subtle)) throw new Error("このブラウザでは暗号化が使えません（https のページで開いてください）。"); return crypto.subtle; };
+const b64 = buf => { const u = new Uint8Array(buf); let s = ""; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(s); };
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const u8 = s => new TextEncoder().encode(s);
+const EC = { name: "ECDH", namedCurve: "P-256" };
+const PASS_ITER = 600000, RECOVERY_ITER = 100000, LOCK_MIN = 15;
+async function pwKey(secret, salt, iter) {
+  const base = await subtle().importKey("raw", u8(secret), "PBKDF2", false, ["deriveKey"]);
+  return subtle().deriveKey({ name: "PBKDF2", salt, iterations: iter, hash: "SHA-256" }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+}
+async function sealWith(key, bytes) { const iv = crypto.getRandomValues(new Uint8Array(12)); return { iv: b64(iv), ct: b64(await subtle().encrypt({ name: "AES-GCM", iv }, key, bytes)) }; }
+async function openWith(key, box) { return new Uint8Array(await subtle().decrypt({ name: "AES-GCM", iv: unb64(box.iv) }, key, unb64(box.ct))); }
+async function wrapSecret(bytes, secret, iter) { const salt = crypto.getRandomValues(new Uint8Array(16)); return { salt: b64(salt), iter, ...(await sealWith(await pwKey(secret, salt, iter), bytes)) }; }
+async function unwrapSecret(w, secret) { return openWith(await pwKey(secret, unb64(w.salt), w.iter), w); }
+const importPriv = pkcs8 => subtle().importKey("pkcs8", pkcs8, EC, false, ["deriveBits"]);
+async function aesFrom(bits, epk) { const h = await subtle().digest("SHA-256", new Uint8Array([...new Uint8Array(bits), ...epk])); return subtle().importKey("raw", h, "AES-GCM", false, ["encrypt", "decrypt"]); }
+async function sealRecord(obj, pubB64) {
+  const pub = await subtle().importKey("spki", unb64(pubB64), EC, false, []);
+  const eph = await subtle().generateKey(EC, true, ["deriveBits"]);
+  const bits = await subtle().deriveBits({ name: "ECDH", public: pub }, eph.privateKey, 256);
+  const epk = new Uint8Array(await subtle().exportKey("raw", eph.publicKey));
+  return { v: 1, epk: b64(epk), ...(await sealWith(await aesFrom(bits, epk), u8(JSON.stringify(obj)))) };
+}
+async function openRecord(box, priv) {
+  const epk = unb64(box.epk);
+  const pub = await subtle().importKey("raw", epk, EC, false, []);
+  const bits = await subtle().deriveBits({ name: "ECDH", public: pub }, priv, 256);
+  return JSON.parse(new TextDecoder().decode(await openWith(await aesFrom(bits, epk), box)));
+}
+const RC = "ABCDEFGHJKMNPQRSTVWXYZ23456789";
+const newRecoveryKey = () => [...crypto.getRandomValues(new Uint8Array(28))].map(x => RC[x % RC.length]).join("").match(/.{4}/g).join("-");
+const normRecovery = s => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+const LED_FIELDS = ["title", "type", "category", "amount", "date", "owner", "method", "settled", "memo"];
+const ledPlain = o => Object.fromEntries(LED_FIELDS.map(k => [k, o[k] ?? ""]));
+const vaultReady = () => !!(S.vaultPub && S.vaultKey);
+/* 届いた暗号文を、ロックを解除している間だけ元に戻す（同じ暗号文は2回戻さない） */
+let decSeq = 0;
+async function decryptLedger() {
+  if (!finView()) return;
+  if (!S.priv) { S.ledger = []; return; }
+  const seq = ++decSeq; S.decCache = S.decCache || {};
+  const out = [];
+  for (const r of S.ledgerRaw || []) {
+    const meta = { id: r.id, createdBy: r.createdBy, confirmed: !!r.confirmed, updatedBy: r.updatedBy, createdAt: r.createdAt, source: r.source || "" };
+    if (!r.enc) { out.push({ ...meta, ...ledPlain(r), legacy: true }); continue; }
+    const c = S.decCache[r.id];
+    if (c && c.ct === r.enc.ct) { out.push({ ...meta, ...c.data }); continue; }
+    try { const data = await openRecord(r.enc, S.priv); S.decCache[r.id] = { ct: r.enc.ct, data }; out.push({ ...meta, ...data }); }
+    catch (e) { out.push({ ...meta, title: "（読み取れない記録）", type: "支出", amount: 0, date: "", broken: true }); }
+  }
+  if (seq !== decSeq) return;
+  S.ledger = out; render();
+}
+/* 追加だけの人：自分用の控え（ledgerMine）と、確認状況（ledger の confirmed）を合わせて表示する */
+function mergeMine() {
+  if (finView()) return;
+  S.ledger = (S.mine || []).filter(m => (S.ledgerRaw || []).some(r => r.id === m.id)).map(m => ({ ...m, confirmed: !!((S.ledgerRaw || []).find(r => r.id === m.id) || {}).confirmed }));
+}
+function lockVault(msg) { S.priv = null; S.ledger = []; S.decCache = {}; if (msg) toast(msg, "info"); render(); }
+let lastActive = Date.now();
+["pointerdown", "keydown", "scroll"].forEach(t => document.addEventListener(t, () => { lastActive = Date.now(); }, { passive: true }));
+setInterval(() => { if (S.priv && Date.now() - lastActive > LOCK_MIN * 60e3) lockVault(`${LOCK_MIN}分間操作がなかったので、収支をロックしました`); }, 30e3);
+async function unlockVault(pass) {
+  const pk = await unwrapSecret(S.vaultKey.wrapped, pass).catch(() => null);
+  if (!pk) throw new Error("パスワードが違います。");
+  S.priv = await importPriv(pk); lastActive = Date.now();
+  await decryptLedger();
+  if (finEdit()) migrateLegacy();
+}
+/* 暗号化を設定する前に入っていた記録（平文）を、暗号化して置き換える */
+async function migrateLegacy() {
+  const legacy = (S.ledgerRaw || []).filter(r => !r.enc && r.title !== undefined);
+  if (!legacy.length || !S.vaultPub) return;
+  for (let i = 0; i < legacy.length; i += 200) {
+    const b = writeBatch(db);
+    for (const r of legacy.slice(i, i + 200)) b.set(doc(db, "ledger", r.id), { enc: await sealRecord(ledPlain(r), S.vaultPub), createdBy: r.createdBy || uid(), createdAt: r.createdAt || serverTimestamp(), confirmed: r.confirmed !== false, updatedBy: uid(), updatedAt: serverTimestamp() });
+    await b.commit();
+  }
+  toast(`暗号化する前の記録${legacy.length}件を暗号化しました`, "info");
+}
+async function setupVault(pass) {
+  const kp = await subtle().generateKey(EC, true, ["deriveBits"]);
+  const pkcs8 = new Uint8Array(await subtle().exportKey("pkcs8", kp.privateKey));
+  const pub = b64(await subtle().exportKey("spki", kp.publicKey));
+  const rk = newRecoveryKey();
+  await setDoc(doc(db, "vault", "key"), { wrapped: await wrapSecret(pkcs8, pass, PASS_ITER), recovery: await wrapSecret(pkcs8, normRecovery(rk), RECOVERY_ITER), pub, createdBy: uid(), createdAt: serverTimestamp() });
+  await setDoc(doc(db, "config", "vaultPub"), { pub, createdAt: serverTimestamp() });
+  S.vaultPub = pub; S.priv = await importPriv(pkcs8); S.pendingRecovery = rk; lastActive = Date.now();
+  return rk;
+}
+async function rewrapVault(fromSecret, isRecovery, newPass) {
+  const pk = await unwrapSecret(isRecovery ? S.vaultKey.recovery : S.vaultKey.wrapped, isRecovery ? normRecovery(fromSecret) : fromSecret).catch(() => null);
+  if (!pk) throw new Error(isRecovery ? "復旧キーが違います。" : "今のパスワードが違います。");
+  await updateDoc(doc(db, "vault", "key"), { wrapped: await wrapSecret(pk, newPass, PASS_ITER), changedBy: uid(), changedAt: serverTimestamp() });
+  S.priv = await importPriv(pk); lastActive = Date.now();
+}
+const passRule = p => (p || "").length >= 10 ? "" : "パスワードは10文字以上にしてください。";
+function vVaultSetup() {
+  if (S.pendingRecovery) return `<div class="bar"><h2 class="vh">収支</h2></div><section class="panel vault-box">
+    <h3>復旧キーを書き留めてください</h3>
+    <p style="margin:0 0 10px">閲覧用パスワードを忘れたとき、<b>このキーがないと収支のデータは誰にも元に戻せません</b>。紙に書いて、PCやスマホとは別の場所に保管してください。この画面を閉じると、二度と表示されません。</p>
+    <div class="rk">${esc(S.pendingRecovery)}</div>
+    <p><button class="btn sec small" type="button" data-act="vault-rk-copy">コピー</button></p>
+    <label class="checks"><input type="checkbox" id="v-rk-ok">紙に書き留めて、保管しました</label>
+    <p style="margin:12px 0 0"><button class="btn" type="button" data-act="vault-rk-done">収支を開く</button></p></section>`;
+  return `<div class="bar"><h2 class="vh">収支</h2></div><form class="panel vault-box" id="vault-setup">
+    <h3>収支の暗号化を設定する（最初の1回だけ）</h3>
+    <p class="muted" style="margin:0 0 12px;font-size:.88rem">収支と口座情報は、ここで決める「閲覧用パスワード」で暗号化して保存します。Googleアカウントのパスワードとは別のものにしてください。副管理者など「すべて見る」がオンの人には、このパスワードを口頭など安全な方法で伝えます。</p>
+    <div class="field"><span class="lbl">閲覧用パスワード（10文字以上）</span><input type="password" id="v-pass" autocomplete="new-password" minlength="10" required></div>
+    <div class="field" style="margin-top:10px"><span class="lbl">もう一度</span><input type="password" id="v-pass2" autocomplete="new-password" required></div>
+    <p class="err" id="v-err" hidden></p>
+    <p style="margin:14px 0 0"><button class="btn" type="submit">暗号化を設定する</button></p></form>`;
+}
+function vVaultLock() {
+  return `<div class="bar"><h2 class="vh">収支</h2></div><form class="panel vault-box" id="vault-unlock">
+    <h3><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>収支はロックされています</h3>
+    <p class="muted" style="margin:0 0 12px;font-size:.88rem">閲覧用パスワードを入れると、この端末の中でだけ元に戻して表示します。${LOCK_MIN}分間操作がないと、自動でロックします。</p>
+    <div class="field"><span class="lbl">閲覧用パスワード</span><input type="password" id="v-pass" autocomplete="current-password" required></div>
+    <p class="err" id="v-err" hidden></p>
+    <p style="margin:14px 0 0;display:flex;gap:12px;align-items:center;flex-wrap:wrap"><button class="btn" type="submit">開く</button>${S.isAdmin ? `<button class="link" type="button" data-act="vault-recover">パスワードを忘れた（復旧キーを使う）</button>` : `<span class="muted" style="font-size:.8rem">パスワードは管理者に確認してください</span>`}</p></form>`;
+}
+const vErr = m => { const p = document.getElementById("v-err"); if (p) { p.hidden = false; p.textContent = m; } };
+document.addEventListener("submit", async e => {
+  const f = e.target; if (!f.matches || !f.matches("#vault-setup, #vault-unlock")) return;
+  e.preventDefault(); const btn = f.querySelector("[type=submit]"); const pass = f.querySelector("#v-pass").value;
+  if (f.id === "vault-setup") {
+    const er = passRule(pass); if (er) return vErr(er);
+    if (pass !== f.querySelector("#v-pass2").value) return vErr("2つのパスワードが一致しません。");
+  }
+  btn.disabled = true; btn.textContent = f.id === "vault-setup" ? "設定しています…" : "開いています…";
+  try {
+    if (f.id === "vault-setup") { await setupVault(pass); f.querySelector("#v-pass").value = ""; render(); }
+    else { await unlockVault(pass); f.querySelector("#v-pass").value = ""; S.anim = "in"; render(); }
+  } catch (err) { btn.disabled = false; btn.textContent = f.id === "vault-setup" ? "暗号化を設定する" : "開く"; vErr(err.message || errMsg(err)); }
+});
+function vaultPassDialog(recovery) {
+  const body = (recovery ? fld("復旧キー", `<input name="from" id="f-from" required autocomplete="off" placeholder="XXXX-XXXX-…">`, { full: true, req: true, help: "暗号化を設定したときに書き留めたキー（ハイフンはあってもなくても可）" })
+    : fld("今のパスワード", `<input type="password" name="from" id="f-from" required autocomplete="current-password">`, { full: true, req: true })) +
+    fld("新しいパスワード（10文字以上）", `<input type="password" name="np" id="f-np" required autocomplete="new-password">`, { full: true, req: true }) +
+    fld("もう一度", `<input type="password" name="np2" id="f-np2" required autocomplete="new-password">`, { full: true, req: true, help: "「すべて見る」がオンの人にも、新しいパスワードを伝えてください" });
+  openDlg(recovery ? "復旧キーで新しいパスワードにする" : "閲覧用パスワードを変える", body, {
+    submit: async f => {
+      const er = passRule(f.np); if (er) return showErr(er), false;
+      if (f.np !== f.np2) return showErr("2つのパスワードが一致しません。"), false;
+      try { await rewrapVault(f.from, recovery, f.np); } catch (e) { return showErr(e.message), false; }
+      await decryptLedger(); S.anim = "in";
+      return "閲覧用パスワードを変えました";
+    }
+  });
+}
+
+const canEditLed = r => finEdit() || (r.createdBy === uid() && finAdd());
 const ledStatus = r => r.confirmed ? `<span class="pill good">確認済</span>` : `<span class="pill plain">未確認</span>`;
 /* 収支を「追加だけ」できる人の画面：自分が追加した記録だけ */
 function vMyLedger() {
   const rows = S.ledger.filter(r => r.createdBy === uid()).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
   const head = `<div class="bar"><h2 class="vh">収支</h2><span class="muted" style="font-size:.85rem;margin-right:auto">あなたが記録したものだけが表示されます</span><button class="btn" type="button" data-act="led-new">収支を記録</button></div>
-    <p class="muted" style="font-size:.82rem;margin:-8px 0 14px">管理者が確認すると「確認済」になり、それ以降は編集できません。間違いに気づいたら管理者に連絡してください。</p>`;
+    <p class="muted" style="font-size:.82rem;margin:-8px 0 14px">記録は暗号化して保存され、全体を見られるのは管理者と許可された人だけです。この一覧は、あなただけが見られる控えです。間違えたときは、管理者が確認する前（未確認のうち）なら、記録を開いて取り消せます。</p>`;
   if (!rows.length) return head + `<div class="empty"><p>まだ記録はありません。</p><button class="btn small" type="button" data-act="led-new">記録を追加</button></div>`;
   return head + `<div class="tablewrap"><table class="ledger-table"><thead><tr><th>日付</th><th>項目</th><th>区分</th><th>カテゴリ</th><th class="num">金額</th><th>担当者</th><th>支払方法</th><th>状態</th></tr></thead><tbody>
     ${rows.map(r => `<tr class="${canEditLed(r) ? "click" : ""}" ${canEditLed(r) ? `data-act="led-edit" data-id="${esc(r.id)}" tabindex="0"` : ""}><td class="c-date">${md(r.date)}</td><td class="c-title" style="white-space:normal;min-width:12em">${esc(r.title)}${r.memo ? `<div class="muted" style="font-size:.75rem">${esc(r.memo)}</div>` : ""}</td><td class="c-meta"><span class="pill ${r.type === "収入" ? "good" : "bad"}">${esc(r.type)}</span></td><td class="c-meta">${esc(r.category || "")}</td><td class="num c-amt ${r.type === "収入" ? "pos" : "neg"}">${r.type === "収入" ? "+" : "−"}${yen(r.amount)}</td><td class="c-meta">${esc(r.owner || "")}</td><td class="c-meta">${esc(r.method || "")}</td><td class="c-meta">${ledStatus(r)}</td><td class="c-sub">${esc([r.category, r.method].filter(Boolean).join("・"))} ${ledStatus(r)}</td></tr>`).join("")}
@@ -643,6 +795,8 @@ function vMyLedger() {
 }
 function vMoney() {
   if (!finView()) return vMyLedger();
+  if (!vaultReady() || S.pendingRecovery) return S.isAdmin ? vVaultSetup() : `<div class="bar"><h2 class="vh">収支</h2></div><div class="empty"><p>管理者が収支の暗号化を設定するまでお待ちください。</p></div>`;
+  if (!S.priv) return vVaultLock();
   const m = S.moneyMonth; const rows = S.ledger.filter(r => (r.date || "").startsWith(m)).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
   const inc = sumBy(rows, "収入"), exp = sumBy(rows, "支出");
   const monthEnd = ymd(new Date(Number(m.slice(0, 4)), Number(m.slice(5, 7)), 0));
@@ -653,7 +807,7 @@ function vMoney() {
   const maxC = Math.max(1, ...Object.values(cats), ...Object.values(icats));
   const bars = (o, cls) => Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<div class="hbar ${cls}"><span>${esc(k)}</span><span class="track"><i style="width:${(v / maxC * 100).toFixed(1)}%"></i></span><span class="val">${yen(v)}</span></div>`).join("");
   const stPill = s => s === "未精算" ? `<span class="pill warn">未精算</span>` : s === "精算済" ? `<span class="pill good">精算済</span>` : `<span class="pill plain">${esc(s || "対象外")}</span>`;
-  return `<div class="bar"><h2 class="vh">収支</h2>${monthNav("moneyMonth")}${finEdit() ? `<button class="btn sec" type="button" data-act="led-import">CSVを取り込む</button>` : ""}${finAdd() ? `<button class="btn" type="button" data-act="led-new">収支を記録</button>` : ""}${!finEdit() ? `<span class="pill plain">${finAdd() ? "閲覧と自分の記録の追加" : "閲覧のみ"}</span>` : ""}</div>
+  return `<div class="bar"><h2 class="vh">収支</h2>${monthNav("moneyMonth")}<button class="ghost" type="button" data-act="vault-lock" title="収支をロックする">ロック</button>${S.isAdmin ? `<button class="ghost" type="button" data-act="vault-pass">パスワード変更</button>` : ""}${finEdit() ? `<button class="btn sec" type="button" data-act="led-import">CSVを取り込む</button>` : ""}${finAdd() ? `<button class="btn" type="button" data-act="led-new">収支を記録</button>` : ""}${!finEdit() ? `<span class="pill plain">${finAdd() ? "閲覧と自分の記録の追加" : "閲覧のみ"}</span>` : ""}</div>
   <div class="figs money-figs">
     <div class="fig"><div class="k">収入</div><div class="v pos">${cu(inc, "yen")}</div></div>
     <div class="fig"><div class="k">支出</div><div class="v neg">${cu(exp, "yen")}</div></div>
@@ -1459,6 +1613,11 @@ function issueDialog(it) {
   autoMore();
   if (!it) restoreDraft();
 }
+function myLedDialog(r) {
+  const body = fld("日付", `<div class="ro">${md(r.date)}</div>`) + fld("金額", `<div class="ro">${r.type === "収入" ? "+" : "−"}${yen(r.amount)}</div>`) +
+    fld("項目", `<div class="ro">${esc(r.title)}</div>`, { full: true }) + fld("状態", `<div class="ro">${ledStatus(r)}</div>`, { full: true, help: r.confirmed ? "管理者が確認済みなので、取り消せません。間違いがあれば管理者に連絡してください" : "間違えた場合は、下の「削除」で取り消して、もう一度記録してください" });
+  openDlg("自分の記録", body, { readOnly: true, del: r.confirmed ? null : () => { const b = writeBatch(db); b.delete(doc(db, "ledger", r.id)); b.delete(doc(db, "ledgerMine", r.id)); return b.commit(); } });
+}
 function ledDialog(r) {
   const c = cfg(); const names = activeMembers().map(m => m.name || m.email);
   const lastL = memGet("last_led") || {};
@@ -1477,14 +1636,24 @@ function ledDialog(r) {
   openDlg(r ? "収支を編集" : "収支を記録", body, {
     submit: async f => {
       const amt = Number(f.amount); if (!(amt >= 0)) return showErr("金額を数字で入力してください。"), false;
-      const data = { title: f.title.trim(), type: f.type, category: f.category, amount: amt, date: f.date, owner: f.owner || "", method: f.method, settled: f.settled, memo: f.memo.trim(), updatedBy: uid(), updatedAt: serverTimestamp() };
-      if (finEdit()) data.confirmed = !!f.confirmed;
+      const data = { title: f.title.trim(), type: f.type, category: f.category, amount: amt, date: f.date, owner: f.owner || "", method: f.method, settled: f.settled, memo: f.memo.trim() };
       if (!data.title) return showErr("項目を入力してください。"), false;
-      if (r) await updateDoc(doc(db, "ledger", r.id), data);
-      else { Object.assign(data, { createdBy: uid(), createdAt: serverTimestamp() }); if (!finEdit()) data.confirmed = false; await addDoc(collection(db, "ledger"), data); memSet("last_led", { type: data.type, category: data.category, owner: data.owner, method: data.method, settled: data.settled }); }
+      if (!S.vaultPub) return showErr("管理者が収支の暗号化を設定するまで、記録できません。"), false;
+      const enc = await sealRecord(data, S.vaultPub);
+      const meta = { enc, updatedBy: uid(), updatedAt: serverTimestamp() };
+      if (r) await updateDoc(doc(db, "ledger", r.id), { ...meta, confirmed: !!f.confirmed });
+      else if (finEdit()) await addDoc(collection(db, "ledger"), { ...meta, confirmed: !!f.confirmed, createdBy: uid(), createdAt: serverTimestamp() });
+      else {
+        // 追加だけの人：暗号化した本体と、自分だけが見られる控え（日付・項目・区分・金額）を同時に保存
+        const ref = doc(collection(db, "ledger")); const b = writeBatch(db);
+        b.set(ref, { ...meta, confirmed: false, createdBy: uid(), createdAt: serverTimestamp() });
+        b.set(doc(db, "ledgerMine", ref.id), { createdBy: uid(), date: data.date, title: data.title, type: data.type, amount: data.amount, category: data.category, method: data.method, createdAt: serverTimestamp() });
+        await b.commit();
+      }
+      if (!r) memSet("last_led", { type: data.type, category: data.category, owner: data.owner, method: data.method, settled: data.settled });
       S.moneyMonth = f.date.slice(0, 7);
     },
-    del: r && canEditLed(r) ? () => deleteDoc(doc(db, "ledger", r.id)) : null,
+    del: r && finEdit() ? () => { const b = writeBatch(db); b.delete(doc(db, "ledger", r.id)); b.delete(doc(db, "ledgerMine", r.id)); return b.commit(); } : null,
     draft: null   // 収支は端末に下書きを残さない
   });
   const ty = form.querySelector("#f-type"), ca = form.querySelector("#f-category");
@@ -1521,7 +1690,7 @@ function importDialog() {
       if (ix("項目") < 0 || ix("金額") < 0 || ix("日付") < 0 || ix("区分") < 0) return showErr("「項目」「区分」「金額」「日付」の列が見つかりません。"), false;
       const items = rows.slice(1).map(r => {
         const g = n => ix(n) < 0 ? "" : (r[ix(n)] || "").trim();
-        return { title: g("項目"), type: g("区分") === "収入" ? "収入" : "支出", category: g("カテゴリ") || "その他", amount: Number(g("金額").replace(/[¥￥,円\s]/g, "")) || 0, date: normDate(g("日付")), owner: g("担当者"), method: g("支払方法"), settled: g("精算") || "対象外", memo: g("メモ"), createdBy: uid(), createdAt: serverTimestamp(), confirmed: true };
+        return { title: g("項目"), type: g("区分") === "収入" ? "収入" : "支出", category: g("カテゴリ") || "その他", amount: Number(g("金額").replace(/[¥￥,円\s]/g, "")) || 0, date: normDate(g("日付")), owner: g("担当者"), method: g("支払方法"), settled: g("精算") || "対象外", memo: g("メモ") };
       }).filter(x => x.title && x.date);
       if (!items.length) return showErr("取り込める行がありませんでした。日付の形式を確認してください。"), false;
       const keyOf = x => [x.date, x.title, Number(x.amount), x.type].join("|");
@@ -1530,7 +1699,7 @@ function importDialog() {
       const skipped = items.length - fresh.length;
       if (!fresh.length) { closeDlg(); toast("すべて登録済みでした（" + skipped + "件）。追加はありません", "info"); return false; }
       items.length = 0; items.push(...fresh); S.importSkipped = skipped;
-      for (let i = 0; i < items.length; i += 400) { const b = writeBatch(db); items.slice(i, i + 400).forEach(x => b.set(doc(collection(db, "ledger")), x)); await b.commit(); }
+      for (let i = 0; i < items.length; i += 200) { const b = writeBatch(db); for (const x of items.slice(i, i + 200)) b.set(doc(collection(db, "ledger")), { enc: await sealRecord(ledPlain(x), S.vaultPub), confirmed: true, createdBy: uid(), createdAt: serverTimestamp(), updatedBy: uid(), updatedAt: serverTimestamp() }); await b.commit(); }
       closeDlg(); toast(items.length + "件を取り込みました" + (S.importSkipped ? "（登録済みの" + S.importSkipped + "件は飛ばしました）" : "")); return false;
     }
   });
@@ -1575,9 +1744,14 @@ document.addEventListener("click", async e => {
   if (act === "day") { S.selDay = a.dataset.d; render();
     if (window.matchMedia && matchMedia("(max-width:860px)").matches) openSheet({ kind: "day", d: a.dataset.d }); else { S.pulse = ".day-panel"; render(); }
     return; }
-  if (act === "led-edit") { const r = S.ledger.find(x => x.id === id); if (r && canEditLed(r)) ledDialog(r); return; }
+  if (act === "led-edit") { const r = S.ledger.find(x => x.id === id); if (r && finEdit()) ledDialog(r); else if (r && canEditLed(r)) myLedDialog(r); return; }
+  if (act === "vault-lock") { lockVault("収支をロックしました"); return; }
+  if (act === "vault-pass") { if (S.isAdmin) vaultPassDialog(false); return; }
+  if (act === "vault-recover") { if (S.isAdmin) vaultPassDialog(true); return; }
+  if (act === "vault-rk-copy") { copyPlain(S.pendingRecovery || "", "復旧キーをコピーしました。紙にも書き留めてください"); return; }
+  if (act === "vault-rk-done") { const ok = document.getElementById("v-rk-ok"); if (!ok || !ok.checked) { toast("書き留めたら、チェックを入れてください", "warn"); return; } S.pendingRecovery = null; S.anim = "in"; render(); migrateLegacy(); return; }
   if (act === "led-new") { if (finAdd()) ledDialog(null); return; }
-  if (act === "led-import") { if (finEdit()) importDialog(); return; }
+  if (act === "led-import") { if (finEdit() && S.priv) importDialog(); return; }
   if (act === "inv-new") return inviteDialog();
   if (act === "issue-new") { if (can("issue_add")) issueDialog(null); return; }
   if (act === "issue-open") return issueDialog((S.issues || []).find(i => i.id === id));
@@ -1629,7 +1803,7 @@ document.addEventListener("click", async e => {
     try { await setDoc(doc(db, "config", "main"), out, { merge: true }); if (perms) await setDoc(doc(db, "config", "perms"), perms); S.settingsDirty = false; toast("設定を保存しました"); render(); } catch (err) { toast(errMsg(err), "error"); }
   }
 });
-document.addEventListener("keydown", e => { if (e.key === "Enter") { const r = e.target.closest && e.target.closest("tr[data-act=led-edit]"); if (r) { const x = S.ledger.find(y => y.id === r.dataset.id); if (x && canEditLed(x)) ledDialog(x); } } });
+document.addEventListener("keydown", e => { if (e.key === "Enter") { const r = e.target.closest && e.target.closest("tr[data-act=led-edit]"); if (r) { const x = S.ledger.find(y => y.id === r.dataset.id); if (x && finEdit()) ledDialog(x); else if (x && canEditLed(x)) myLedDialog(x); } } });
 document.addEventListener("change", async e => {
   const a = e.target.closest("[data-act]"); if (!a || (a.closest("dialog") && !a.closest("form.is-sheet"))) return;
   const act = a.dataset.act, id = a.dataset.id;
