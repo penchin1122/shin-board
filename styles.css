@@ -1,14 +1,15 @@
 /* SHIN 運営ボード
-   Layout: 白を基調に、ブランド色（仮：濃いローズ〜薄ピンク）をアクセントとして使う。ヘッダーは白、タブは下線で選択状態を示す。
+   Layout: 白を基調に、ロゴのコーラルレッド〜淡いピンクをアクセントとして使う。ヘッダーは白、タブは下線で選択状態を示す。
    デジタル庁デザインシステムに合わせ、Noto Sans JP・明確なフォーカス表示・十分なコントラストを基本にする */
 :root{
-  /* 仮の配色（薄ピンク）。ロゴが決まったらここの値だけ差し替える */
-  --bg:#FFFFFF; --surface:#FFFFFF; --surface-2:#F7F3F5; --line:#E8DDE2;
-  --fg:#23191E; --muted:#6B5A63;
-  --navy:#6E1F45; --sky:#F2B8CC;
-  --accent:#A8325F; --accent-soft:#FBEAF1; --accent-fg:#FFFFFF;
-  --shadow:80,30,55;
-  --good:#1A7A49; --good-soft:#E3F3EA; --warn:#A6500A; --warn-soft:#FDF0E1; --bad:#BE2E2C; --bad-soft:#FBE7E6;
+  /* SHINのロゴの色（コーラルレッド〜淡いピンク）。白基調で、色はボタン・選択中・見出しのアクセントだけに使う */
+  --bg:#FFFFFF; --surface:#FFFFFF; --surface-2:#F8F4F3; --line:#EBDFDD;
+  --fg:#1F1A1A; --muted:#695B5A;
+  --brand-light:#F6C3BD; --brand:#E23E3B;          /* ロゴのグラデーションの両端（装飾用。文字色には使わない） */
+  --navy:#8A2A27; --sky:#F6C3BD;                   /* 濃い色＝見出し・選択中の文字、淡い色＝線の装飾 */
+  --accent:#C4342F; --accent-soft:#FDECEA; --accent-fg:#FFFFFF;   /* 白文字とのコントラスト 5.4:1 */
+  --shadow:120,40,35;
+  --good:#1A7A49; --good-soft:#E3F3EA; --warn:#A6500A; --warn-soft:#FDF0E1; --bad:#A11D33; --bad-soft:#FBE6EA;
   --m1:#1E5FC4; --m2:#0E8A82; --m3:#B7791F; --m4:#C2417A; --m5:#6B4FC2; --m6:#4A7A2A;
   --font-display:"Zen Kaku Gothic New","Noto Sans JP","Hiragino Sans",sans-serif;
   --font-body:"Noto Sans JP","Hiragino Sans","Yu Gothic",sans-serif;
@@ -25,7 +26,7 @@ button,input,select,textarea{font:inherit;color:inherit}
 :focus-visible{outline:3px solid var(--accent);outline-offset:2px}
 
 .mast{background:#FFFFFF;color:var(--navy);position:sticky;top:0;z-index:5;padding-top:env(safe-area-inset-top,0px);border-bottom:1px solid var(--line)}
-.mast::after{content:"";position:absolute;left:0;right:0;top:0;height:3px;background:linear-gradient(90deg,var(--navy),var(--accent) 55%,var(--sky))}
+.mast::after{content:"";position:absolute;left:0;right:0;top:0;height:3px;background:linear-gradient(90deg,var(--brand),var(--brand-light))}
 .mast .wrap{padding-block:14px 0;position:relative}
 .mast-top{display:flex;align-items:center;gap:12px}
 .mast-top > div:nth-child(2){min-width:0}
@@ -112,7 +113,7 @@ td input.name-in{width:9em;padding:4px 6px;border:1px solid var(--line);border-r
 .cal .dow{background:var(--surface-2);font-size:.75rem;text-align:center;padding:6px 0;color:var(--muted);font-weight:700}
 .cal .day{background:var(--surface);min-height:104px;padding:4px 6px 6px;cursor:pointer;display:flex;flex-direction:column;gap:3px;min-width:0;border:0;text-align:left;font:inherit;color:inherit}
 .cal .day:hover{background:var(--surface-2)}
-.cal .day.out{background:#FBF9FA;color:var(--muted)}
+.cal .day.out{background:#FBF8F7;color:var(--muted)}
 .cal .day.sel{box-shadow:inset 0 0 0 2px var(--accent)}
 .cal .d{font-size:.8rem;font-weight:700;line-height:1.6}
 .cal .day.today .d span{background:var(--accent);color:var(--accent-fg);border-radius:999px;padding:0 6px}
@@ -524,7 +525,7 @@ label.checks input{margin-top:.3em;flex:none}
   body.has-nav .drawer-bg{display:none}
   body.has-nav .drawer{padding-top:0}
   body.has-nav .drawer-head{box-sizing:border-box;height:var(--mast-h,auto);padding:env(safe-area-inset-top,0px) 16px 0;position:relative}
-  body.has-nav .drawer-head::before{content:"";position:absolute;left:0;right:0;top:0;height:3px;background:var(--navy)}
+  body.has-nav .drawer-head::before{content:"";position:absolute;left:0;right:0;top:0;height:3px;background:var(--brand)}
   body.has-nav.menu-open{overflow:visible}
   body.has-nav.nav-collapsed{padding-left:0}
   body.has-nav.nav-collapsed .drawer{transform:translateX(-102%);visibility:hidden}
