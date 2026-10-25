@@ -245,6 +245,7 @@ function startData() {
   if (finView()) {
     listen("vaultKey", doc(db, "vault", "key"), s => S.vaultKey = s.exists() ? s.data() : null);
     listen("ledger", collection(db, "ledger"), s => { S.ledgerRaw = docsOf(s); decryptLedger(); });
+    listen("accounts", collection(db, "accounts"), s => { S.accountsRaw = docsOf(s); decryptLedger(); });
   } else if (finAdd()) {
     listen("ledger", query(collection(db, "ledger"), where("createdBy", "==", uid())), s => { S.ledgerRaw = docsOf(s); mergeMine(); });
     listen("mine", query(collection(db, "ledgerMine"), where("createdBy", "==", uid())), s => { S.mine = docsOf(s); mergeMine(); });
@@ -646,49 +647,57 @@ async function wrapSecret(bytes, secret, iter) { const salt = crypto.getRandomVa
 async function unwrapSecret(w, secret) { return openWith(await pwKey(secret, unb64(w.salt), w.iter), w); }
 const importPriv = pkcs8 => subtle().importKey("pkcs8", pkcs8, EC, false, ["deriveBits"]);
 async function aesFrom(bits, epk) { const h = await subtle().digest("SHA-256", new Uint8Array([...new Uint8Array(bits), ...epk])); return subtle().importKey("raw", h, "AES-GCM", false, ["encrypt", "decrypt"]); }
-async function sealRecord(obj, pubB64) {
+async function sealRaw(bytes, pubB64) {
   const pub = await subtle().importKey("spki", unb64(pubB64), EC, false, []);
   const eph = await subtle().generateKey(EC, true, ["deriveBits"]);
   const bits = await subtle().deriveBits({ name: "ECDH", public: pub }, eph.privateKey, 256);
   const epk = new Uint8Array(await subtle().exportKey("raw", eph.publicKey));
-  return { v: 1, epk: b64(epk), ...(await sealWith(await aesFrom(bits, epk), u8(JSON.stringify(obj)))) };
+  return { v: 1, epk: b64(epk), ...(await sealWith(await aesFrom(bits, epk), bytes)) };
 }
-async function openRecord(box, priv) {
+async function openRaw(box, priv) {
   const epk = unb64(box.epk);
   const pub = await subtle().importKey("raw", epk, EC, false, []);
   const bits = await subtle().deriveBits({ name: "ECDH", public: pub }, priv, 256);
-  return JSON.parse(new TextDecoder().decode(await openWith(await aesFrom(bits, epk), box)));
+  return openWith(await aesFrom(bits, epk), box);
 }
+const sealRecord = (obj, pubB64) => sealRaw(u8(JSON.stringify(obj)), pubB64);
+const openRecord = async (box, priv) => JSON.parse(new TextDecoder().decode(await openRaw(box, priv)));
 const RC = "ABCDEFGHJKMNPQRSTVWXYZ23456789";
 const newRecoveryKey = () => [...crypto.getRandomValues(new Uint8Array(28))].map(x => RC[x % RC.length]).join("").match(/.{4}/g).join("-");
 const normRecovery = s => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
-const LED_FIELDS = ["title", "type", "category", "amount", "date", "owner", "method", "settled", "memo"];
+const LED_FIELDS = ["title", "type", "category", "amount", "date", "owner", "method", "settled", "memo", "account", "fromAccount", "toAccount"];
 const ledPlain = o => Object.fromEntries(LED_FIELDS.map(k => [k, o[k] ?? ""]));
 const vaultReady = () => !!(S.vaultPub && S.vaultKey);
 /* 届いた暗号文を、ロックを解除している間だけ元に戻す（同じ暗号文は2回戻さない） */
 let decSeq = 0;
 async function decryptLedger() {
   if (!finView()) return;
-  if (!S.priv) { S.ledger = []; return; }
+  if (!S.priv) { S.ledger = []; S.accounts = []; return; }
   const seq = ++decSeq; S.decCache = S.decCache || {};
   const out = [];
   for (const r of S.ledgerRaw || []) {
-    const meta = { id: r.id, createdBy: r.createdBy, confirmed: !!r.confirmed, updatedBy: r.updatedBy, createdAt: r.createdAt, source: r.source || "" };
+    const meta = { id: r.id, createdBy: r.createdBy, confirmed: !!r.confirmed, updatedBy: r.updatedBy, createdAt: r.createdAt, source: r.source || "", hasReceipt: !!r.hasReceipt };
     if (!r.enc) { out.push({ ...meta, ...ledPlain(r), legacy: true }); continue; }
     const c = S.decCache[r.id];
     if (c && c.ct === r.enc.ct) { out.push({ ...meta, ...c.data }); continue; }
     try { const data = await openRecord(r.enc, S.priv); S.decCache[r.id] = { ct: r.enc.ct, data }; out.push({ ...meta, ...data }); }
     catch (e) { out.push({ ...meta, title: "（読み取れない記録）", type: "支出", amount: 0, date: "", broken: true }); }
   }
+  const accs = [];
+  for (const a of S.accountsRaw || []) {
+    const c = S.decCache["acc:" + a.id];
+    if (c && c.ct === a.enc.ct) { accs.push({ id: a.id, order: a.order, ...c.data }); continue; }
+    try { const data = await openRecord(a.enc, S.priv); S.decCache["acc:" + a.id] = { ct: a.enc.ct, data }; accs.push({ id: a.id, order: a.order, ...data }); } catch (e) { accs.push({ id: a.id, order: a.order, name: "（読み取れない口座）" }); }
+  }
   if (seq !== decSeq) return;
-  S.ledger = out; render();
+  S.ledger = out; S.accounts = accs; render();
 }
 /* 追加だけの人：自分用の控え（ledgerMine）と、確認状況（ledger の confirmed）を合わせて表示する */
 function mergeMine() {
   if (finView()) return;
   S.ledger = (S.mine || []).filter(m => (S.ledgerRaw || []).some(r => r.id === m.id)).map(m => ({ ...m, confirmed: !!((S.ledgerRaw || []).find(r => r.id === m.id) || {}).confirmed }));
 }
-function lockVault(msg) { S.priv = null; S.ledger = []; S.decCache = {}; if (msg) toast(msg, "info"); render(); }
+function lockVault(msg) { S.priv = null; S.ledger = []; S.accounts = []; S.decCache = {}; if (msg) toast(msg, "info"); render(); }
 let lastActive = Date.now();
 ["pointerdown", "keydown", "scroll"].forEach(t => document.addEventListener(t, () => { lastActive = Date.now(); }, { passive: true }));
 setInterval(() => { if (S.priv && Date.now() - lastActive > LOCK_MIN * 60e3) lockVault(`${LOCK_MIN}分間操作がなかったので、収支をロックしました`); }, 30e3);
@@ -781,6 +790,101 @@ function vaultPassDialog(recovery) {
   });
 }
 
+/* ===================== 口座（銀行・Stripe・現金）：中身はすべて暗号化して保存 ===================== */
+const ACC_KINDS = ["銀行", "Stripe", "現金", "その他"];
+const ACC_FIELDS = ["name", "kind", "bank", "branch", "acctType", "number", "holder", "opening", "openingDate", "memo"];
+const accName = id => ((S.accounts || []).find(a => a.id === id) || {}).name || "";
+const maskNo = n => n ? "••••" + String(n).slice(-4) : "";
+const sortedAccs = () => (S.accounts || []).slice().sort((a, b) => (a.order || 0) - (b.order || 0));
+function accountBalances(asOf) {
+  const accs = S.accounts || []; const def = (accs.find(a => a.kind === "銀行") || accs[0] || {}).id;
+  const bal = Object.fromEntries(accs.map(a => [a.id, a.openingDate && a.openingDate > asOf ? 0 : (Number(a.opening) || 0)]));
+  let unassigned = 0;
+  // 開始残高を入れた日より前の記録は、その口座の残高に含めない（開始残高に含まれているため）
+  const add = (id, v, date) => { const a = accs.find(x => x.id === id); if (!a) { unassigned += v; return; } if (a.openingDate && date < a.openingDate) return; bal[id] += v; };
+  S.ledger.forEach(r => {
+    if (!r.date || r.broken) return; const amt = Number(r.amount) || 0;
+    if (r.type === "振替") { if (r.date <= asOf) { add(r.fromAccount, -amt, r.date); add(r.toAccount, amt, r.date); } return; }
+    const acc = r.account || def;
+    if (r.type === "収入") { if (r.date <= asOf) add(acc, amt, r.date); return; }
+    if (r.type !== "支出") return;
+    if (isCard(r)) { if (cardPayDate(r.date) <= asOf) add(acc, -amt, r.date); return; }
+    if (r.date <= asOf) add(acc, -amt, r.date);
+  });
+  return { bal, unassigned, total: Object.values(bal).reduce((a, b) => a + b, 0) };
+}
+function accountsPanel(asOf, label) {
+  const accs = sortedAccs();
+  if (!accs.length) return finEdit() ? `<section class="panel acc-panel"><h3>口座</h3><p class="muted" style="margin:0 0 10px;font-size:.85rem">銀行・Stripe・現金などを登録すると、口座ごとの残高が出ます。口座の情報は暗号化して保存します。</p><button class="btn small" type="button" data-act="acc-new">口座を追加</button></section>` : "";
+  const { bal, unassigned } = accountBalances(asOf);
+  return `<section class="panel acc-panel"><h3>口座<span class="hint">${esc(label)}時点の残高</span>${finEdit() ? `<button class="btn sec small" type="button" data-act="acc-new">＋ 口座を追加</button>` : ""}</h3>
+    <div class="acc-list">${accs.map(a => `<button type="button" class="acc-row" data-act="acc-open" data-id="${esc(a.id)}"><span class="pill plain">${esc(a.kind || "")}</span><span class="acc-name"><b>${esc(a.name)}</b><small class="muted">${esc([a.bank, a.branch, a.acctType, maskNo(a.number)].filter(Boolean).join(" "))}</small></span><span class="acc-bal ${bal[a.id] < 0 ? "neg" : ""}">${bal[a.id] < 0 ? "−" : ""}${yen(Math.abs(bal[a.id]))}</span></button>`).join("")}</div>
+    ${unassigned ? `<p class="muted" style="margin:8px 0 0;font-size:.78rem">口座が決まっていない記録：${unassigned < 0 ? "−" : "+"}${yen(Math.abs(unassigned))}（最初の銀行口座として計算しています）</p>` : ""}</section>`;
+}
+function accountDialog(a) {
+  if (a && !finEdit()) {
+    const ro = (l, v) => fld(l, `<div class="ro">${esc(v || "—")}</div>`, { full: true });
+    openDlg(a.name, ro("種類", a.kind) + ro("銀行名", a.bank) + ro("支店", a.branch) + ro("口座の種類", a.acctType) + ro("口座番号", a.number) + ro("名義", a.holder) + ro("開始残高", a.opening !== "" && a.opening != null ? yen(a.opening) + (a.openingDate ? `（${md(a.openingDate)}時点）` : "") : "") + ro("メモ", a.memo), { readOnly: true });
+    return;
+  }
+  const v = a || { name: "", kind: "銀行", bank: "", branch: "", acctType: "普通", number: "", holder: "", opening: "", openingDate: TODAY, memo: "" };
+  const body = fld("口座の名前", `<input name="name" id="f-name" required maxlength="30" value="${esc(v.name)}" placeholder="例：三井住友 普通、Stripe、小口現金">`, { full: true, req: true }) +
+    fld("種類", sel("kind", ACC_KINDS, v.kind), { full: true, help: v.kind === "Stripe" ? "Stripe連携を設定すると、売上・手数料・入金が自動で記録されます" : "" }) +
+    `<div class="field full acc-bank" ${v.kind === "銀行" ? "" : "hidden"}><div class="dlg-b" style="padding:0">` +
+      fld("銀行名", `<input name="bank" id="f-bank" value="${esc(v.bank || "")}" placeholder="例：三井住友銀行">`) + fld("支店", `<input name="branch" id="f-branch" value="${esc(v.branch || "")}" placeholder="例：渋谷支店">`) +
+      fld("口座の種類", sel("acctType", ["普通", "当座", "貯蓄"], v.acctType || "普通")) + fld("口座番号", `<input name="number" id="f-number" inputmode="numeric" value="${esc(v.number || "")}" autocomplete="off">`) +
+      fld("名義", `<input name="holder" id="f-holder" value="${esc(v.holder || "")}" placeholder="例：カ）シン">`, { full: true }) + `</div></div>` +
+    fld("開始残高（円）", `<input name="opening" id="f-opening" type="number" step="1" value="${esc(v.opening ?? "")}">`, { half: true }) +
+    fld("その日付", `<input type="date" name="openingDate" id="f-openingDate" value="${esc(v.openingDate || "")}">`, { half: true }) +
+    `<p class="muted full" style="grid-column:1/-1;margin:-4px 0 0;font-size:.75rem">通帳やネットバンキングに出ている、その日の残高を入れます。これより前の日付の記録は、この口座の残高に足しません。</p>` +
+    fld("メモ", `<textarea name="memo" id="f-memo">${esc(v.memo || "")}</textarea>`, { full: true }) +
+    `<p class="banner full" style="grid-column:1/-1;margin:0">ネットバンキングのIDやパスワード、暗証番号は入れないでください。</p>`;
+  const used = a ? S.ledger.filter(r => r.account === a.id || r.fromAccount === a.id || r.toAccount === a.id).length : 0;
+  openDlg(a ? "口座を編集" : "口座を追加", body, {
+    submit: async f => {
+      const data = Object.fromEntries(ACC_FIELDS.map(k => [k, (f[k] ?? "").toString().trim()]));
+      if (!data.name) return showErr("口座の名前を入力してください。"), false;
+      data.opening = data.opening === "" ? "" : Number(data.opening);
+      if (data.kind !== "銀行") Object.assign(data, { bank: "", branch: "", acctType: "", number: "", holder: "" });
+      const enc = await sealRecord(data, S.vaultPub);
+      if (a) await updateDoc(doc(db, "accounts", a.id), { enc, updatedBy: uid(), updatedAt: serverTimestamp() });
+      else await addDoc(collection(db, "accounts"), { enc, order: Date.now(), createdBy: uid(), createdAt: serverTimestamp() });
+      return a ? "口座を保存しました" : "口座を追加しました";
+    },
+    del: a ? () => deleteDoc(doc(db, "accounts", a.id)) : null,
+    delInBody: a ? { label: "この口座を削除", help: used ? `この口座を使っている記録が${used}件あります。削除すると、それらは「口座が決まっていない記録」になります` : "元に戻せません" } : null
+  });
+  const k = form.querySelector("#f-kind"), bk = form.querySelector(".acc-bank");
+  k.addEventListener("change", () => { bk.hidden = k.value !== "銀行"; });
+}
+/* ===== 領収書：画像はこの端末で小さくしてから、暗号化して保存 ===== */
+const RC_MAX = 450 * 1024, PDF_MAX = 600 * 1024;
+async function prepReceipt(file) {
+  if (file.type === "application/pdf" || /\.pdf$/i.test(file.name)) {
+    if (file.size > PDF_MAX) throw new Error("PDFは600KBまでです。大きい場合は、画面を写真で撮って添付してください。");
+    return { bytes: new Uint8Array(await file.arrayBuffer()), mime: "application/pdf" };
+  }
+  if (!/^image\//.test(file.type)) throw new Error("画像かPDFを選んでください。");
+  let img;
+  try { img = await createImageBitmap(file); }
+  catch (e) { img = await new Promise((ok, ng) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => ng(new Error("この画像は読み込めませんでした。JPEGかPNGで撮り直してください。")); i.src = URL.createObjectURL(file); }); }
+  let max = 1600;
+  for (let t = 0; t < 6; t++) {
+    const sc = Math.min(1, max / Math.max(img.width, img.height)); const w = Math.max(1, Math.round(img.width * sc)), h = Math.max(1, Math.round(img.height * sc));
+    const cv = document.createElement("canvas"); cv.width = w; cv.height = h; const cx = cv.getContext("2d"); cx.fillStyle = "#fff"; cx.fillRect(0, 0, w, h); cx.drawImage(img, 0, 0, w, h);
+    for (const q of [0.72, 0.6, 0.5]) { const blob = await new Promise(ok => cv.toBlob(ok, "image/jpeg", q)); if (blob && blob.size <= RC_MAX) return { bytes: new Uint8Array(await blob.arrayBuffer()), mime: "image/jpeg" }; }
+    max = Math.round(max * 0.75);
+  }
+  throw new Error("画像を小さくできませんでした。別の写真で試してください。");
+}
+async function viewReceipt(id) {
+  if (!S.priv) return toast("収支のロックを解除してから開いてください", "warn");
+  const s = await getDoc(doc(db, "receipts", id)); if (!s.exists()) return toast("領収書が見つかりませんでした", "error");
+  const d = s.data(); const bytes = await openRaw(d.enc, S.priv);
+  const url = URL.createObjectURL(new Blob([bytes], { type: d.mime || "image/jpeg" }));
+  openDlg("領収書", d.mime === "application/pdf" ? `<p class="full" style="grid-column:1/-1"><a class="btn" href="${url}" target="_blank" rel="noopener">PDFを開く</a></p>` : `<div class="full" style="grid-column:1/-1"><img class="rc-img" src="${url}" alt="領収書"><p style="margin:8px 0 0"><a class="link" href="${url}" download="receipt-${esc(id)}.jpg">保存する</a></p></div>`, { readOnly: true });
+}
+
 const canEditLed = r => finEdit() || (r.createdBy === uid() && finAdd());
 const ledStatus = r => r.confirmed ? `<span class="pill good">確認済</span>` : `<span class="pill plain">未確認</span>`;
 /* 収支を「追加だけ」できる人の画面：自分が追加した記録だけ */
@@ -790,7 +894,7 @@ function vMyLedger() {
     <p class="muted" style="font-size:.82rem;margin:-8px 0 14px">記録は暗号化して保存され、全体を見られるのは管理者と許可された人だけです。この一覧は、あなただけが見られる控えです。間違えたときは、管理者が確認する前（未確認のうち）なら、記録を開いて取り消せます。</p>`;
   if (!rows.length) return head + `<div class="empty"><p>まだ記録はありません。</p><button class="btn small" type="button" data-act="led-new">記録を追加</button></div>`;
   return head + `<div class="tablewrap"><table class="ledger-table"><thead><tr><th>日付</th><th>項目</th><th>区分</th><th>カテゴリ</th><th class="num">金額</th><th>担当者</th><th>支払方法</th><th>状態</th></tr></thead><tbody>
-    ${rows.map(r => `<tr class="${canEditLed(r) ? "click" : ""}" ${canEditLed(r) ? `data-act="led-edit" data-id="${esc(r.id)}" tabindex="0"` : ""}><td class="c-date">${md(r.date)}</td><td class="c-title" style="white-space:normal;min-width:12em">${esc(r.title)}${r.memo ? `<div class="muted" style="font-size:.75rem">${esc(r.memo)}</div>` : ""}</td><td class="c-meta"><span class="pill ${r.type === "収入" ? "good" : "bad"}">${esc(r.type)}</span></td><td class="c-meta">${esc(r.category || "")}</td><td class="num c-amt ${r.type === "収入" ? "pos" : "neg"}">${r.type === "収入" ? "+" : "−"}${yen(r.amount)}</td><td class="c-meta">${esc(r.owner || "")}</td><td class="c-meta">${esc(r.method || "")}</td><td class="c-meta">${ledStatus(r)}</td><td class="c-sub">${esc([r.category, r.method].filter(Boolean).join("・"))} ${ledStatus(r)}</td></tr>`).join("")}
+    ${rows.map(r => `<tr class="${canEditLed(r) ? "click" : ""}" ${canEditLed(r) ? `data-act="led-edit" data-id="${esc(r.id)}" tabindex="0"` : ""}><td class="c-date">${md(r.date)}</td><td class="c-title" style="white-space:normal;min-width:12em">${r.hasReceipt ? `<span class="clip" aria-label="領収書あり">📎</span>` : ""}${esc(r.title)}${r.memo ? `<div class="muted" style="font-size:.75rem">${esc(r.memo)}</div>` : ""}</td><td class="c-meta"><span class="pill ${r.type === "収入" ? "good" : "bad"}">${esc(r.type)}</span></td><td class="c-meta">${esc(r.category || "")}</td><td class="num c-amt ${r.type === "収入" ? "pos" : "neg"}">${r.type === "収入" ? "+" : "−"}${yen(r.amount)}</td><td class="c-meta">${esc(r.owner || "")}</td><td class="c-meta">${esc(r.method || "")}</td><td class="c-meta">${ledStatus(r)}</td><td class="c-sub">${esc([r.category, r.method].filter(Boolean).join("・"))} ${ledStatus(r)}</td></tr>`).join("")}
   </tbody></table></div>`;
 }
 function vMoney() {
@@ -801,7 +905,7 @@ function vMoney() {
   const inc = sumBy(rows, "収入"), exp = sumBy(rows, "支出");
   const monthEnd = ymd(new Date(Number(m.slice(0, 4)), Number(m.slice(5, 7)), 0));
   const asOf = m === THISMONTH ? TODAY : monthEnd;
-  const bk = bankBalance(asOf);
+  const bk = bankBalance(asOf); const ab = accountBalances(asOf); const asLabel = m === THISMONTH ? "今日" : md(asOf).replace(/\(.\)/, "");
   const group = type => { const o = {}; rows.filter(r => r.type === type).forEach(r => o[r.category || "その他"] = (o[r.category || "その他"] || 0) + (Number(r.amount) || 0)); return o; };
   const cats = group("支出"), icats = group("収入");
   const maxC = Math.max(1, ...Object.values(cats), ...Object.values(icats));
@@ -812,15 +916,16 @@ function vMoney() {
     <div class="fig"><div class="k">収入</div><div class="v pos">${cu(inc, "yen")}</div></div>
     <div class="fig"><div class="k">支出</div><div class="v neg">${cu(exp, "yen")}</div></div>
     <div class="fig"><div class="k">月の収支</div><div class="v ${inc - exp >= 0 ? "pos" : "neg"}">${cu(inc - exp, "yen", inc - exp >= 0 ? "+" : "−")}</div></div>
-    <div class="fig"><div class="k">銀行残高（${m === THISMONTH ? "今日" : md(asOf).replace(/\(.\)/, "")}時点）</div><div class="v">${cu(bk.bal, "yen", bk.bal < 0 ? "−" : "")}</div>
-      <div class="s">${bk.pending ? `カードの未引き落とし ${yen(bk.pending)} を引く前の額` : "未引き落としのカード利用なし"}</div></div>
+    <div class="fig"><div class="k">口座の合計残高（${asLabel}時点）</div><div class="v">${cu(ab.total + ab.unassigned, "yen", ab.total + ab.unassigned < 0 ? "−" : "")}</div>
+      <div class="s">${bk.pending ? `カードの未引き落とし ${yen(bk.pending)} を引く前の額` : (S.accounts || []).length ? "未引き落としのカード利用なし" : "口座を登録すると、口座ごとに出ます"}</div></div>
     ${S.ledger.some(isCard) ? bk.pays.map((p, i) => { const fixed = p.closing <= asOf; const from = parse(p.closing); from.setMonth(from.getMonth() - 1); from.setDate(16);
       return `<div class="fig card-pay"><div class="k">${i === 0 ? "次回のカード" : "その次のカード"}　${md(p.date)}</div><div class="v neg">${cu(p.amount, "yen")}</div>
         <div class="s">${md(ymd(from)).replace(/\(.\)/, "")}〜${md(p.closing).replace(/\(.\)/, "")}利用・${p.count}件・${fixed ? "確定" : "締め前（増える可能性あり）"}</div></div>`; }).join("") : ""}
   </div>
   <div class="stack">
+    ${accountsPanel(asOf, asLabel)}
     ${rows.length ? `<div class="tablewrap"><table class="ledger-table"><thead><tr><th>日付</th><th>項目</th><th>区分</th><th>カテゴリ</th><th class="num">金額</th><th>担当者</th><th>支払方法</th><th>精算</th></tr></thead><tbody>
-      ${rows.map(r => `<tr class="${canEditLed(r) ? "click" : ""}" ${canEditLed(r) ? `data-act="led-edit" data-id="${esc(r.id)}" tabindex="0"` : ""}><td class="c-date">${md(r.date)}</td><td class="c-title" style="white-space:normal;min-width:12em">${esc(r.title)}${r.memo ? `<div class="muted" style="font-size:.75rem">${esc(r.memo)}</div>` : ""}<div class="muted" style="font-size:.72rem">記録：${esc(r.createdBy ? memName(r.createdBy) : "—")}${r.confirmed ? "・確認済" : "・未確認"}</div></td><td class="c-meta"><span class="pill ${r.type === "収入" ? "good" : "bad"}">${esc(r.type)}</span></td><td class="c-meta">${esc(r.category || "")}</td><td class="num c-amt ${r.type === "収入" ? "pos" : "neg"}">${r.type === "収入" ? "+" : "−"}${yen(r.amount)}</td><td class="c-meta">${esc(r.owner || "")}</td><td class="c-meta">${esc(r.method || "")}</td><td class="c-meta">${stPill(r.settled)}</td><td class="c-sub">${esc([r.category, r.owner, r.method].filter(Boolean).join("・"))} ${stPill(r.settled)}</td></tr>`).join("")}
+      ${rows.map(r => `<tr class="${canEditLed(r) ? "click" : ""}" ${canEditLed(r) ? `data-act="led-edit" data-id="${esc(r.id)}" tabindex="0"` : ""}><td class="c-date">${md(r.date)}</td><td class="c-title" style="white-space:normal;min-width:12em">${r.hasReceipt ? `<span class="clip" title="領収書あり" aria-label="領収書あり">📎</span>` : ""}${esc(r.title)}${r.type === "支出" && !r.hasReceipt ? ` <span class="pill warn">領収書なし</span>` : ""}${r.memo ? `<div class="muted" style="font-size:.75rem">${esc(r.memo)}</div>` : ""}<div class="muted" style="font-size:.72rem">${r.type === "振替" ? esc(`${accName(r.fromAccount) || "?"} → ${accName(r.toAccount) || "?"}`) + "・" : r.account ? esc(accName(r.account)) + "・" : ""}記録：${esc(r.source === "stripe" ? "Stripe（自動）" : r.createdBy ? memName(r.createdBy) : "—")}${r.confirmed ? "・確認済" : "・未確認"}</div></td><td class="c-meta"><span class="pill ${r.type === "収入" ? "good" : r.type === "振替" ? "plain" : "bad"}">${esc(r.type)}</span></td><td class="c-meta">${esc(r.category || "")}</td><td class="num c-amt ${r.type === "収入" ? "pos" : r.type === "振替" ? "" : "neg"}">${r.type === "収入" ? "+" : r.type === "振替" ? "⇄" : "−"}${yen(r.amount)}</td><td class="c-meta">${esc(r.owner || "")}</td><td class="c-meta">${esc(r.method || "")}</td><td class="c-meta">${stPill(r.settled)}</td><td class="c-sub">${esc([r.category, r.owner, r.method].filter(Boolean).join("・"))} ${stPill(r.settled)}</td></tr>`).join("")}
     </tbody></table></div>` : `<div class="empty"><p>${monthLabel(m)}の記録はありません。</p>${finAdd() ? `<button class="btn small" type="button" data-act="led-new">記録を追加</button>` : ""}</div>`}
     ${rows.length ? `<div class="grid2"><section class="panel"><h3>支出の内訳</h3>${Object.keys(cats).length ? bars(cats, "out") : `<p class="muted" style="margin:0">支出はありません。</p>`}</section>
       <section class="panel"><h3>収入の内訳</h3>${Object.keys(icats).length ? bars(icats, "") : `<p class="muted" style="margin:0">収入はありません。</p>`}</section></div>` : ""}
@@ -1616,49 +1721,72 @@ function issueDialog(it) {
 function myLedDialog(r) {
   const body = fld("日付", `<div class="ro">${md(r.date)}</div>`) + fld("金額", `<div class="ro">${r.type === "収入" ? "+" : "−"}${yen(r.amount)}</div>`) +
     fld("項目", `<div class="ro">${esc(r.title)}</div>`, { full: true }) + fld("状態", `<div class="ro">${ledStatus(r)}</div>`, { full: true, help: r.confirmed ? "管理者が確認済みなので、取り消せません。間違いがあれば管理者に連絡してください" : "間違えた場合は、下の「削除」で取り消して、もう一度記録してください" });
-  openDlg("自分の記録", body, { readOnly: true, del: r.confirmed ? null : () => { const b = writeBatch(db); b.delete(doc(db, "ledger", r.id)); b.delete(doc(db, "ledgerMine", r.id)); return b.commit(); } });
+  openDlg("自分の記録", body + (r.hasReceipt ? fld("領収書", `<div class="ro"><span class="pill good">添付済み</span></div>`, { full: true }) : ""), { readOnly: true, del: r.confirmed ? null : () => { const b = writeBatch(db); b.delete(doc(db, "ledger", r.id)); b.delete(doc(db, "ledgerMine", r.id)); if (r.hasReceipt) b.delete(doc(db, "receipts", r.id)); return b.commit(); } });
 }
 function ledDialog(r) {
-  const c = cfg(); const names = activeMembers().map(m => m.name || m.email);
+  const c = cfg(); const accs = finView() && S.priv ? sortedAccs() : [];
   const lastL = memGet("last_led") || {};
-  const v = r || { date: TODAY, type: lastL.type || "支出", category: lastL.category || c.expenseCats[0], owner: lastL.owner || memName(uid()), method: lastL.method || "現金", settled: lastL.settled || "未精算", title: "", amount: "", memo: "" };
-  const ownerList = v.owner && !names.includes(v.owner) ? [...names, v.owner] : names;
+  const v = r || { date: TODAY, type: lastL.type === "収入" ? "収入" : "支出", category: lastL.category || c.expenseCats[0], owner: lastL.owner || memName(uid()), method: lastL.method || "現金", settled: lastL.settled || "未精算", title: "", amount: "", memo: "", account: lastL.account || "", fromAccount: "", toAccount: "" };
+  const types = accs.length >= 2 || v.type === "振替" ? ["支出", "収入", "振替"] : ["支出", "収入"];
   const catList = t => t === "収入" ? c.incomeCats : c.expenseCats;
+  const accOpts = [["", "（未設定）"], ...accs.map(a => [a.id, a.name])];
+  const canRc = !r || finEdit();
   const body = fld("項目", `<input name="title" id="f-title" required value="${esc(v.title)}" placeholder="例：Anam.ai 10月分">`, { full: true, req: true }) +
-    fld("区分", sel("type", ["収入", "支出"], v.type)) + fld("カテゴリ", sel("category", catList(v.type), v.category)) +
+    fld("区分", sel("type", types, v.type)) + `<div class="field" id="cat-field"><span class="lbl">カテゴリ</span>${sel("category", catList(v.type === "振替" ? "支出" : v.type), v.category)}</div>` +
     fld("金額（円）", `<input name="amount" id="f-amount" type="number" min="0" step="1" required value="${esc(v.amount)}">`, { req: true }) +
     fld("日付", `<input type="date" name="date" id="f-date" required value="${esc(v.date)}">`, { req: true }) +
-    fld("担当者", memberChips("owner", [v.owner], { multi: false, byName: true, extra: [v.owner] }), { full: true }) + fld("支払方法", sel("method", c.methods, v.method)) +
-    fld("精算", sel("settled", ["未精算", "精算済", "対象外"], v.settled), { help: "立替払いは「未精算」、返金したら「精算済」" }) +
+    (accs.length ? `<div class="field full" id="acc-field"><span class="lbl">口座</span>${sel("account", accOpts, v.account || "")}<span class="help">どの口座のお金か（カード払いは、引き落としの口座）</span></div>
+      <div class="field" id="tr-from"><span class="lbl">移す元の口座<span class="req">必須</span></span>${sel("fromAccount", accOpts, v.fromAccount || "")}</div>
+      <div class="field" id="tr-to"><span class="lbl">移す先の口座<span class="req">必須</span></span>${sel("toAccount", accOpts, v.toAccount || "")}</div>
+      <p class="muted full" id="tr-help" style="grid-column:1/-1;margin:-4px 0 0;font-size:.75rem">振替（Stripeから銀行への入金、現金の預け入れなど）は、収入にも支出にも数えません。</p>` : "") +
+    `<div class="field full" id="owner-field"><span class="lbl">担当者</span>${memberChips("owner", [v.owner], { multi: false, byName: true, extra: [v.owner] })}</div>` +
+    `<div class="field" id="method-field"><span class="lbl">支払方法</span>${sel("method", c.methods, v.method)}</div>` +
+    `<div class="field" id="settled-field"><span class="lbl">精算</span>${sel("settled", ["未精算", "精算済", "対象外"], v.settled)}<span class="help">立替払いは「未精算」、返金したら「精算済」</span></div>` +
     fld("メモ", `<textarea name="memo" id="f-memo">${esc(v.memo || "")}</textarea>`, { full: true }) +
-    (finEdit() ? `<div class="field full"><label class="checks" style="font-size:.88rem"><input type="checkbox" name="confirmed" id="f-confirmed" value="1" ${r && r.confirmed ? "checked" : ""}>確認済みにする（記録した本人は編集できなくなる）</label></div>` : "") +
-    (r && r.createdBy ? `<p class="muted full" style="grid-column:1/-1;margin:0;font-size:.78rem">記録：${esc(memName(r.createdBy))}${r.updatedBy && r.updatedBy !== r.createdBy ? `・最終更新：${esc(memName(r.updatedBy))}` : ""}</p>` : "");
+    `<div class="field full" id="rc-field"><span class="lbl">領収書（任意）</span>${r && r.hasReceipt ? `<div class="ro"><span class="pill good">添付済み</span>${S.priv ? ` <button class="link" type="button" id="rc-view">見る</button>` : ""}</div>` : ""}${canRc ? `<input type="file" id="f-receipt" accept="image/*,application/pdf"><span class="help">写真はこの端末で小さくしてから、暗号化して保存します。PDFは600KBまで${r && r.hasReceipt ? "。選ぶと差し替えます" : ""}</span>` : ""}</div>` +
+    (finEdit() ? `<div class="field full"><label class="checks" style="font-size:.88rem"><input type="checkbox" name="confirmed" id="f-confirmed" value="1" ${r && r.confirmed ? "checked" : ""}>確認済みにする（記録した本人は取り消せなくなる）</label></div>` : "") +
+    (r && (r.createdBy || r.source) ? `<p class="muted full" style="grid-column:1/-1;margin:0;font-size:.78rem">記録：${esc(r.source === "stripe" ? "Stripe（自動）" : memName(r.createdBy))}${r.updatedBy && r.updatedBy !== r.createdBy ? `・最終更新：${esc(memName(r.updatedBy))}` : ""}</p>` : "");
   openDlg(r ? "収支を編集" : "収支を記録", body, {
     submit: async f => {
-      const amt = Number(f.amount); if (!(amt >= 0)) return showErr("金額を数字で入力してください。"), false;
-      const data = { title: f.title.trim(), type: f.type, category: f.category, amount: amt, date: f.date, owner: f.owner || "", method: f.method, settled: f.settled, memo: f.memo.trim() };
+      const amt = Number(f.amount); if (!(amt >= 0) || f.amount === "") return showErr("金額を数字で入力してください。"), false;
+      const tr = f.type === "振替";
+      const data = { title: f.title.trim(), type: f.type, category: tr ? "振替" : f.category, amount: amt, date: f.date, owner: f.owner || "", method: tr ? "" : f.method, settled: tr ? "対象外" : f.settled, memo: f.memo.trim(), account: tr ? "" : (f.account || ""), fromAccount: tr ? f.fromAccount : "", toAccount: tr ? f.toAccount : "" };
       if (!data.title) return showErr("項目を入力してください。"), false;
+      if (tr && (!data.fromAccount || !data.toAccount || data.fromAccount === data.toAccount)) return showErr("振替は、移す元と移す先に別々の口座を選んでください。"), false;
       if (!S.vaultPub) return showErr("管理者が収支の暗号化を設定するまで、記録できません。"), false;
+      const file = form.querySelector("#f-receipt") && form.querySelector("#f-receipt").files[0];
+      let rc = null; if (file) { try { rc = await prepReceipt(file); } catch (e) { return showErr(e.message), false; } }
       const enc = await sealRecord(data, S.vaultPub);
+      const rcDoc = rc ? { enc: await sealRaw(rc.bytes, S.vaultPub), mime: rc.mime, size: rc.bytes.length, createdBy: uid(), createdAt: serverTimestamp() } : null;
       const meta = { enc, updatedBy: uid(), updatedAt: serverTimestamp() };
-      if (r) await updateDoc(doc(db, "ledger", r.id), { ...meta, confirmed: !!f.confirmed });
-      else if (finEdit()) await addDoc(collection(db, "ledger"), { ...meta, confirmed: !!f.confirmed, createdBy: uid(), createdAt: serverTimestamp() });
-      else {
-        // 追加だけの人：暗号化した本体と、自分だけが見られる控え（日付・項目・区分・金額）を同時に保存
+      if (r) {
+        if (rcDoc) await setDoc(doc(db, "receipts", r.id), rcDoc);
+        await updateDoc(doc(db, "ledger", r.id), { ...meta, confirmed: !!f.confirmed, ...(rcDoc ? { hasReceipt: true } : {}) });
+      } else {
         const ref = doc(collection(db, "ledger")); const b = writeBatch(db);
-        b.set(ref, { ...meta, confirmed: false, createdBy: uid(), createdAt: serverTimestamp() });
-        b.set(doc(db, "ledgerMine", ref.id), { createdBy: uid(), date: data.date, title: data.title, type: data.type, amount: data.amount, category: data.category, method: data.method, createdAt: serverTimestamp() });
+        b.set(ref, { ...meta, confirmed: finEdit() ? !!f.confirmed : false, hasReceipt: !!rcDoc, createdBy: uid(), createdAt: serverTimestamp() });
+        // 追加だけの人は、自分だけが見られる控え（日付・項目・区分・金額など）も一緒に保存
+        if (!finEdit()) b.set(doc(db, "ledgerMine", ref.id), { createdBy: uid(), date: data.date, title: data.title, type: data.type, amount: data.amount, category: data.category, method: data.method, hasReceipt: !!rcDoc, createdAt: serverTimestamp() });
+        if (rcDoc) b.set(doc(db, "receipts", ref.id), rcDoc);
         await b.commit();
+        memSet("last_led", { type: data.type, category: data.category, owner: data.owner, method: data.method, settled: data.settled, account: data.account });
       }
-      if (!r) memSet("last_led", { type: data.type, category: data.category, owner: data.owner, method: data.method, settled: data.settled });
       S.moneyMonth = f.date.slice(0, 7);
+      return rcDoc ? "保存しました（領収書も暗号化して保存）" : "保存しました";
     },
-    del: r && finEdit() ? () => { const b = writeBatch(db); b.delete(doc(db, "ledger", r.id)); b.delete(doc(db, "ledgerMine", r.id)); return b.commit(); } : null,
+    del: r && finEdit() ? () => { const b = writeBatch(db); b.delete(doc(db, "ledger", r.id)); b.delete(doc(db, "ledgerMine", r.id)); if (r.hasReceipt) b.delete(doc(db, "receipts", r.id)); return b.commit(); } : null,
     draft: null   // 収支は端末に下書きを残さない
   });
   const ty = form.querySelector("#f-type"), ca = form.querySelector("#f-category");
-  ty.addEventListener("change", () => { const keep = ca.value; ca.innerHTML = catList(ty.value).map(o => `<option${o === keep ? " selected" : ""}>${esc(o)}</option>`).join(""); });
-  if (!r) restoreDraft();
+  const show = (id, on) => { const el = form.querySelector(id); if (el) el.hidden = !on; };
+  const sync = () => {
+    const tr = ty.value === "振替";
+    ["#tr-from", "#tr-to", "#tr-help"].forEach(x => show(x, tr)); ["#acc-field", "#cat-field", "#method-field", "#settled-field"].forEach(x => show(x, !tr));
+    if (!tr) { const keep = ca.value; ca.innerHTML = catList(ty.value).map(o => `<option${o === keep ? " selected" : ""}>${esc(o)}</option>`).join(""); }
+  };
+  ty.addEventListener("change", sync); sync();
+  const rv = form.querySelector("#rc-view"); if (rv) rv.addEventListener("click", () => viewReceipt(r.id).catch(e => toast(errMsg(e), "error")));
+  const fi = form.querySelector("#f-receipt"); if (fi) fi.addEventListener("change", () => { const fl = fi.files[0]; if (fl) toast(`${fl.name}（${Math.round(fl.size / 1024)}KB）を添付します。保存すると暗号化して保存します`, "info"); });
 }
 
 /* CSV import (Notionの書き出しと同じ列名：項目,区分,カテゴリ,金額,日付,担当者,支払方法,精算,メモ) */
@@ -1746,6 +1874,8 @@ document.addEventListener("click", async e => {
     return; }
   if (act === "led-edit") { const r = S.ledger.find(x => x.id === id); if (r && finEdit()) ledDialog(r); else if (r && canEditLed(r)) myLedDialog(r); return; }
   if (act === "vault-lock") { lockVault("収支をロックしました"); return; }
+  if (act === "acc-new") { if (finEdit() && S.priv) accountDialog(null); return; }
+  if (act === "acc-open") { const ac = (S.accounts || []).find(x => x.id === id); if (ac) accountDialog(ac); return; }
   if (act === "vault-pass") { if (S.isAdmin) vaultPassDialog(false); return; }
   if (act === "vault-recover") { if (S.isAdmin) vaultPassDialog(true); return; }
   if (act === "vault-rk-copy") { copyPlain(S.pendingRecovery || "", "復旧キーをコピーしました。紙にも書き留めてください"); return; }
