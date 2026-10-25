@@ -786,3 +786,9 @@ dialog{overflow-x:hidden}
 .clip{margin-right:4px;font-size:.85em}
 .rc-img{display:block;max-width:100%;max-height:70vh;margin:0 auto;border:1px solid var(--line);border-radius:6px}
 .field input[type=file]{padding:6px;font-size:.85rem}
+
+/* ===== Stripe連携 ===== */
+.stripe-panel summary{cursor:pointer;display:flex;align-items:center;gap:8px;flex-wrap:wrap;list-style:none}
+.stripe-panel summary::-webkit-details-marker{display:none}
+.stripe-panel summary::before{content:"›";display:inline-block;transition:transform .2s;color:var(--muted);font-size:1.1rem}
+.stripe-panel[open] summary::before{transform:rotate(90deg)}

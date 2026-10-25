@@ -84,6 +84,7 @@ const DEFAULTS = {
 // 毎月デフォルトで用意するKPI（管理者がその月を初めて開いたときに自動で追加）。SHIN用の指標は後で決める
 const DEFAULT_KPIS = [];
 const KPI_TEMPLATES = DEFAULT_KPIS;
+const KPI_AUTO = [["", "しない（担当者が入力）"], ["stripe_mrr", "Stripe：MRR（月ごとの継続課金の売上）"], ["stripe_active", "Stripe：有料会員数"], ["stripe_new", "Stripe：新しく有料会員になった数"], ["stripe_canceled", "Stripe：解約した数"]];
 
 const TABS_ALL = [["home", "ホーム"], ["cal", "業務カレンダー"], ["kpi", "KPI"], ["forms", "フォーム"], ["templates", "テンプレ一覧"], ["minutes", "議事録"], ["money", "収支"], ["admin", "管理（設定・メンバー）"]];
 const TAB_ICON = {
@@ -246,6 +247,7 @@ function startData() {
     listen("vaultKey", doc(db, "vault", "key"), s => S.vaultKey = s.exists() ? s.data() : null);
     listen("ledger", collection(db, "ledger"), s => { S.ledgerRaw = docsOf(s); decryptLedger(); });
     listen("accounts", collection(db, "accounts"), s => { S.accountsRaw = docsOf(s); decryptLedger(); });
+    if (finEdit()) listen("stripeState", doc(db, "config", "stripeState"), s => S.stripeState = s.exists() ? s.data() : null);
   } else if (finAdd()) {
     listen("ledger", query(collection(db, "ledger"), where("createdBy", "==", uid())), s => { S.ledgerRaw = docsOf(s); mergeMine(); });
     listen("mine", query(collection(db, "ledgerMine"), where("createdBy", "==", uid())), s => { S.mine = docsOf(s); mergeMine(); });
@@ -540,9 +542,9 @@ function vKpi() {
     const w = k.weekly || {}; const editable = can("kpi_manage") || (k.owner === uid() && can("kpi_input"));
     const tools = can("kpi_manage") ? `<div class="kpi-tools"><button class="link" type="button" data-act="kpi-edit" data-id="${esc(k.id)}">編集</button></div>` : "";
     const tgt = Number(k.target) > 0 ? `目標 ${num(k.target)}${esc(k.unit || "")}` : "目標未設定";
-    return `<tr><td><span class="kname"><b>${esc(k.name)}</b>${isTrack(k) ? ` <span class="pill plain">記録のみ</span>` : ""}</span><div class="muted" style="font-size:.75rem">${esc(memName(k.owner))}・${k.mode === "latest" ? "最新値" : "合計"}・${tgt}</div>${tools}</td>
+    return `<tr><td><span class="kname"><b>${esc(k.name)}</b>${isTrack(k) ? ` <span class="pill plain">記録のみ</span>` : ""}${k.auto ? ` <span class="pill info">Stripeから自動</span>` : ""}</span><div class="muted" style="font-size:.75rem">${esc(memName(k.owner))}・${k.mode === "latest" ? "最新値" : "合計"}・${tgt}</div>${tools}</td>
       ${weeks.map(wk => { const v = w[wk] && w[wk].value !== null && w[wk].value !== undefined ? w[wk].value : "";
-        return `<td class="num${wk === NEXTMTG ? " now" : ""}" data-label="${mtgLabel(wk)} ${md(wk).replace(/\(.\)/, "")}" data-short="${mtgLabel(wk)}">${editable ? `<input class="cell" id="c-${esc(k.id)}-${wk}" type="number" inputmode="decimal" step="any" aria-label="${esc(k.name)} ${mtgLabel(wk)} ${md(wk)}" data-act="kpi-cell" data-id="${esc(k.id)}" data-wk="${wk}" value="${esc(v)}">` : (v === "" ? `<span class="muted">—</span>` : num(v))}</td>`; }).join("")}</tr>`;
+        return `<td class="num${wk === NEXTMTG ? " now" : ""}" data-label="${mtgLabel(wk)} ${md(wk).replace(/\(.\)/, "")}" data-short="${mtgLabel(wk)}">${editable && !k.auto ? `<input class="cell" id="c-${esc(k.id)}-${wk}" type="number" inputmode="decimal" step="any" aria-label="${esc(k.name)} ${mtgLabel(wk)} ${md(wk)}" data-act="kpi-cell" data-id="${esc(k.id)}" data-wk="${wk}" value="${esc(v)}">` : (v === "" ? `<span class="muted">—</span>` : num(v))}</td>`; }).join("")}</tr>`;
   }).join("");
   return head + `<section class="panel kpi-entry"><h3>MTG・月末ごとの進捗入力<span class="hint hide-sm">進捗はホームで確認</span></h3>
       <p class="kpi-note">第2・第4木曜のMTGと月末に、担当者が実績を入力します。入力すると自動で保存されます。</p>
@@ -885,6 +887,26 @@ async function viewReceipt(id) {
   openDlg("領収書", d.mime === "application/pdf" ? `<p class="full" style="grid-column:1/-1"><a class="btn" href="${url}" target="_blank" rel="noopener">PDFを開く</a></p>` : `<div class="full" style="grid-column:1/-1"><img class="rc-img" src="${url}" alt="領収書"><p style="margin:8px 0 0"><a class="link" href="${url}" download="receipt-${esc(id)}.jpg">保存する</a></p></div>`, { readOnly: true });
 }
 
+/* ===== Stripe連携の設定（管理者）：記録する口座を選ぶ。取り込みは10分おきの自動実行が行う ===== */
+function stripePanel() {
+  if (!finEdit()) return "";
+  const sc = cfg().stripe || {}; const st = S.stripeState || {}; const accs = sortedAccs();
+  const tests = (S.ledgerRaw || []).filter(r => r.source === "stripe-test").length;
+  const opts = (kinds, cur) => `<option value="">（選ぶ）</option>` + accs.filter(a => kinds.includes(a.kind)).map(a => `<option value="${esc(a.id)}" ${a.id === cur ? "selected" : ""}>${esc(a.name)}</option>`).join("");
+  const status = !st.lastRun ? `<span class="pill plain">まだ取り込んでいません</span>` : st.lastError ? `<span class="pill bad">止まっています</span>` : `<span class="pill good">${st.test ? "テストモードで連携中" : "連携中"}</span>`;
+  const when = st.lastRun ? new Date(st.lastRun) : null;
+  return `<details class="panel stripe-panel" ${!sc.account || st.lastError ? "open" : ""}><summary><b>Stripe連携</b> ${status}</summary>
+    <div class="dlg-b" style="padding:12px 0 0">
+      <div class="field"><span class="lbl">Stripeの口座</span><select id="s-stripe-acc">${opts(["Stripe"], sc.account)}</select><span class="help">売上・手数料・返金を記録する口座（種類が「Stripe」の口座）</span></div>
+      <div class="field"><span class="lbl">入金先の口座</span><select id="s-stripe-payout">${opts(["銀行"], sc.payoutAccount)}</select><span class="help">Stripeからの入金を「振替」で記録する先</span></div>
+      <div class="field"><span class="lbl">取り込み開始日</span><input type="date" id="s-stripe-since" value="${esc(sc.since || THISMONTH + "-01")}"><span class="help">この日以降の取引を取り込みます</span></div>
+    </div>
+    <p class="muted" style="font-size:.8rem;margin:8px 0 0">${when ? `最終取り込み：${md(ymd(when))} ${pad(when.getHours())}:${pad(when.getMinutes())}（${st.test ? "テスト" : "本番"}）・前回追加 ${st.lastAdded || 0}件` : "GitHub の Secrets に STRIPE_KEY を登録すると、10分おきに取り込みます。"}${st.metrics ? `・MRR ${yen(st.metrics.stripe_mrr)}・有料会員 ${num(st.metrics.stripe_active)}人` : ""}</p>
+    ${st.lastError ? `<p class="banner" style="margin:8px 0 0">${esc(st.lastError)}</p>` : ""}
+    <p style="margin:10px 0 0;display:flex;gap:10px;flex-wrap:wrap"><button class="btn small" type="button" data-act="stripe-save">保存</button>${tests ? `<button class="btn sec small danger-sec" type="button" data-act="stripe-del-test">${S.armDel === "stripe-test" ? `本当に削除する（${tests}件）` : `テストの記録を削除（${tests}件）`}</button>` : ""}</p>
+    <p class="muted" style="font-size:.75rem;margin:8px 0 0">お客様の名前やメールアドレスは読み込みません。取り込む記録には「領収書なし」は出ません。</p></details>`;
+}
+
 const canEditLed = r => finEdit() || (r.createdBy === uid() && finAdd());
 const ledStatus = r => r.confirmed ? `<span class="pill good">確認済</span>` : `<span class="pill plain">未確認</span>`;
 /* 収支を「追加だけ」できる人の画面：自分が追加した記録だけ */
@@ -924,8 +946,9 @@ function vMoney() {
   </div>
   <div class="stack">
     ${accountsPanel(asOf, asLabel)}
+    ${stripePanel()}
     ${rows.length ? `<div class="tablewrap"><table class="ledger-table"><thead><tr><th>日付</th><th>項目</th><th>区分</th><th>カテゴリ</th><th class="num">金額</th><th>担当者</th><th>支払方法</th><th>精算</th></tr></thead><tbody>
-      ${rows.map(r => `<tr class="${canEditLed(r) ? "click" : ""}" ${canEditLed(r) ? `data-act="led-edit" data-id="${esc(r.id)}" tabindex="0"` : ""}><td class="c-date">${md(r.date)}</td><td class="c-title" style="white-space:normal;min-width:12em">${r.hasReceipt ? `<span class="clip" title="領収書あり" aria-label="領収書あり">📎</span>` : ""}${esc(r.title)}${r.type === "支出" && !r.hasReceipt ? ` <span class="pill warn">領収書なし</span>` : ""}${r.memo ? `<div class="muted" style="font-size:.75rem">${esc(r.memo)}</div>` : ""}<div class="muted" style="font-size:.72rem">${r.type === "振替" ? esc(`${accName(r.fromAccount) || "?"} → ${accName(r.toAccount) || "?"}`) + "・" : r.account ? esc(accName(r.account)) + "・" : ""}記録：${esc(r.source === "stripe" ? "Stripe（自動）" : r.createdBy ? memName(r.createdBy) : "—")}${r.confirmed ? "・確認済" : "・未確認"}</div></td><td class="c-meta"><span class="pill ${r.type === "収入" ? "good" : r.type === "振替" ? "plain" : "bad"}">${esc(r.type)}</span></td><td class="c-meta">${esc(r.category || "")}</td><td class="num c-amt ${r.type === "収入" ? "pos" : r.type === "振替" ? "" : "neg"}">${r.type === "収入" ? "+" : r.type === "振替" ? "⇄" : "−"}${yen(r.amount)}</td><td class="c-meta">${esc(r.owner || "")}</td><td class="c-meta">${esc(r.method || "")}</td><td class="c-meta">${stPill(r.settled)}</td><td class="c-sub">${esc([r.category, r.owner, r.method].filter(Boolean).join("・"))} ${stPill(r.settled)}</td></tr>`).join("")}
+      ${rows.map(r => `<tr class="${canEditLed(r) ? "click" : ""}" ${canEditLed(r) ? `data-act="led-edit" data-id="${esc(r.id)}" tabindex="0"` : ""}><td class="c-date">${md(r.date)}</td><td class="c-title" style="white-space:normal;min-width:12em">${r.hasReceipt ? `<span class="clip" title="領収書あり" aria-label="領収書あり">📎</span>` : ""}${esc(r.title)}${r.type === "支出" && !r.hasReceipt && !/^stripe/.test(r.source || "") ? ` <span class="pill warn">領収書なし</span>` : ""}${r.memo ? `<div class="muted" style="font-size:.75rem">${esc(r.memo)}</div>` : ""}<div class="muted" style="font-size:.72rem">${r.type === "振替" ? esc(`${accName(r.fromAccount) || "?"} → ${accName(r.toAccount) || "?"}`) + "・" : r.account ? esc(accName(r.account)) + "・" : ""}記録：${esc(r.source === "stripe" ? "Stripe（自動）" : r.source === "stripe-test" ? "Stripe（テスト）" : r.createdBy ? memName(r.createdBy) : "—")}${r.confirmed ? "・確認済" : "・未確認"}</div></td><td class="c-meta"><span class="pill ${r.type === "収入" ? "good" : r.type === "振替" ? "plain" : "bad"}">${esc(r.type)}</span></td><td class="c-meta">${esc(r.category || "")}</td><td class="num c-amt ${r.type === "収入" ? "pos" : r.type === "振替" ? "" : "neg"}">${r.type === "収入" ? "+" : r.type === "振替" ? "" : "−"}${yen(r.amount)}</td><td class="c-meta">${esc(r.owner || "")}</td><td class="c-meta">${esc(r.method || "")}</td><td class="c-meta">${stPill(r.settled)}</td><td class="c-sub">${esc([r.category, r.owner, r.method].filter(Boolean).join("・"))} ${stPill(r.settled)}</td></tr>`).join("")}
     </tbody></table></div>` : `<div class="empty"><p>${monthLabel(m)}の記録はありません。</p>${finAdd() ? `<button class="btn small" type="button" data-act="led-new">記録を追加</button>` : ""}</div>`}
     ${rows.length ? `<div class="grid2"><section class="panel"><h3>支出の内訳</h3>${Object.keys(cats).length ? bars(cats, "out") : `<p class="muted" style="margin:0">支出はありません。</p>`}</section>
       <section class="panel"><h3>収入の内訳</h3>${Object.keys(icats).length ? bars(icats, "") : `<p class="muted" style="margin:0">収入はありません。</p>`}</section></div>` : ""}
@@ -1549,6 +1572,7 @@ function kpiDialog(k, preset) {
     `<div class="field full"><label class="checks" style="font-size:.88rem"><input type="checkbox" name="track" id="f-track" value="1" ${trk ? "checked" : ""}>記録のみの指標にする（フォロワー数など。達成率とゲージを出さず、「最新値／目標」と前回からの増減を表示）</label></div>` +
     `<div class="field" id="target-field"><span class="lbl">月次目標<span class="req" id="target-req">必須</span><span class="muted" id="target-opt" style="font-weight:400;margin-left:4px">（任意）</span></span><input name="target" id="f-target" type="number" step="any" min="0" value="${esc(v.target ?? "")}"></div>` +
     fld("単位", `<input name="unit" id="f-unit" value="${esc(v.unit || "")}" placeholder="人・回・件">`) +
+    fld("自動入力", sel("auto", KPI_AUTO, v.auto || ""), { full: true, help: "Stripeを選ぶと、MTG・月末ごとの値を10分おきに自動で入れます（手で入力する欄は出なくなります）" }) +
     fld("集計方法", sel("mode", [["sum", "合計（MTG・月末ごとに、前回から増えた分を入力）"], ["latest", "最新値（MTG・月末時点の数値を入力）"]], v.mode), { full: true }) +
     fld("担当者", memberChips("owner", [v.owner], { multi: false }), { full: true, help: "MTGと月末に進捗を入力する人（1人）" }) +
     fld("対象月", `<input name="month" id="f-month" type="month" required value="${esc(v.month)}">`, { req: true }) +
@@ -1558,7 +1582,8 @@ function kpiDialog(k, preset) {
       if (!f.owner) return showErr("担当者を選んでください。"), false;
       const track = !!f.track;
       if (!track && (f.target === "" || !(Number(f.target) >= 0))) return showErr("月次目標を入力してください（記録のみの指標なら、上のチェックを入れると目標は任意になります）。"), false;
-      const data = { name: f.name.trim(), track, target: f.target === "" ? null : Number(f.target), unit: f.unit.trim(), mode: f.mode, owner: f.owner, month: f.month, viewers: readShare(f, "viewers") };
+      const data = { name: f.name.trim(), track, target: f.target === "" ? null : Number(f.target), unit: f.unit.trim(), mode: f.mode, owner: f.owner, month: f.month, viewers: readShare(f, "viewers"), auto: f.auto || "" };
+      if (data.auto === "stripe_mrr" || data.auto === "stripe_active") data.mode = "latest"; else if (data.auto) data.mode = "sum";
       if (!data.name) return showErr("指標名を入力してください。"), false;
       if (!data.viewers.includes("all") && !data.viewers.includes(data.owner)) data.viewers.push(data.owner);
       if (k) await updateDoc(doc(db, "kpis", k.id), data);
@@ -1744,8 +1769,8 @@ function ledDialog(r) {
     `<div class="field" id="settled-field"><span class="lbl">精算</span>${sel("settled", ["未精算", "精算済", "対象外"], v.settled)}<span class="help">立替払いは「未精算」、返金したら「精算済」</span></div>` +
     fld("メモ", `<textarea name="memo" id="f-memo">${esc(v.memo || "")}</textarea>`, { full: true }) +
     `<div class="field full" id="rc-field"><span class="lbl">領収書（任意）</span>${r && r.hasReceipt ? `<div class="ro"><span class="pill good">添付済み</span>${S.priv ? ` <button class="link" type="button" id="rc-view">見る</button>` : ""}</div>` : ""}${canRc ? `<input type="file" id="f-receipt" accept="image/*,application/pdf"><span class="help">写真はこの端末で小さくしてから、暗号化して保存します。PDFは600KBまで${r && r.hasReceipt ? "。選ぶと差し替えます" : ""}</span>` : ""}</div>` +
-    (finEdit() ? `<div class="field full"><label class="checks" style="font-size:.88rem"><input type="checkbox" name="confirmed" id="f-confirmed" value="1" ${r && r.confirmed ? "checked" : ""}>確認済みにする（記録した本人は取り消せなくなる）</label></div>` : "") +
-    (r && (r.createdBy || r.source) ? `<p class="muted full" style="grid-column:1/-1;margin:0;font-size:.78rem">記録：${esc(r.source === "stripe" ? "Stripe（自動）" : memName(r.createdBy))}${r.updatedBy && r.updatedBy !== r.createdBy ? `・最終更新：${esc(memName(r.updatedBy))}` : ""}</p>` : "");
+    (finEdit() ? `<div class="field full"><label class="checks" style="font-size:.88rem"><input type="checkbox" name="confirmed" id="f-confirmed" value="1" ${!r || r.confirmed ? "checked" : ""}>確認済みにする（記録した本人は取り消せなくなる）</label></div>` : "") +
+    (r && (r.createdBy || r.source) ? `<p class="muted full" style="grid-column:1/-1;margin:0;font-size:.78rem">記録：${esc(/^stripe/.test(r.source || "") ? "Stripe（自動）" : memName(r.createdBy))}${r.updatedBy && r.updatedBy !== r.createdBy ? `・最終更新：${esc(memName(r.updatedBy))}` : ""}</p>` : "");
   openDlg(r ? "収支を編集" : "収支を記録", body, {
     submit: async f => {
       const amt = Number(f.amount); if (!(amt >= 0) || f.amount === "") return showErr("金額を数字で入力してください。"), false;
@@ -1874,6 +1899,18 @@ document.addEventListener("click", async e => {
     return; }
   if (act === "led-edit") { const r = S.ledger.find(x => x.id === id); if (r && finEdit()) ledDialog(r); else if (r && canEditLed(r)) myLedDialog(r); return; }
   if (act === "vault-lock") { lockVault("収支をロックしました"); return; }
+  if (act === "stripe-save") {
+    const acc = document.getElementById("s-stripe-acc").value, po = document.getElementById("s-stripe-payout").value, since = document.getElementById("s-stripe-since").value;
+    if (!acc || !po) { toast("Stripeの口座と入金先の口座を選んでください（先に口座を追加してください）", "warn"); return; }
+    try { await setDoc(doc(db, "config", "main"), { stripe: { account: acc, payoutAccount: po, since: since || THISMONTH + "-01" } }, { merge: true }); toast("Stripe連携の設定を保存しました。10分ほどで取り込みが始まります"); } catch (err) { toast(errMsg(err), "error"); }
+    return;
+  }
+  if (act === "stripe-del-test") {
+    if (S.armDel !== "stripe-test") { S.armDel = "stripe-test"; render(); clearTimeout(S.armTimer); S.armTimer = setTimeout(() => { S.armDel = null; render(); }, 5000); return; }
+    S.armDel = null; const ids = (S.ledgerRaw || []).filter(r => r.source === "stripe-test").map(r => r.id);
+    try { for (let i = 0; i < ids.length; i += 400) { const b = writeBatch(db); ids.slice(i, i + 400).forEach(x => b.delete(doc(db, "ledger", x))); await b.commit(); } await setDoc(doc(db, "config", "stripeState"), { cursor: 0, mode: "" }, { merge: true }).catch(() => { }); toast(`テストの記録を${ids.length}件削除しました`); } catch (err) { toast(errMsg(err), "error"); }
+    return;
+  }
   if (act === "acc-new") { if (finEdit() && S.priv) accountDialog(null); return; }
   if (act === "acc-open") { const ac = (S.accounts || []).find(x => x.id === id); if (ac) accountDialog(ac); return; }
   if (act === "vault-pass") { if (S.isAdmin) vaultPassDialog(false); return; }

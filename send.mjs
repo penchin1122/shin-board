@@ -4,8 +4,9 @@
 //     その人が担当の業務を、その人の現地時間に直して1回だけ送る
 //  2. 未対応事項の通知：追加した人以外に送る。各メンバーの夜間の時間帯には送らず、明けてから届ける
 //  3. 議事録のまとめ：「まとめ待ち」の議事録があれば、Gemini で要約して書き戻し、追加した人に通知する
+//  4. Stripe 連携：取引を収支に（暗号化して）記録し、契約数・MRRをKPIに入れる（STRIPE_KEY があるときだけ）
 import { initializeApp, cert } from "firebase-admin/app";
-import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import { getFirestore, FieldValue, FieldPath } from "firebase-admin/firestore";
 import { getMessaging } from "firebase-admin/messaging";
 
 const SITE_URL = (process.env.SITE_URL || "").replace(/\/?$/, "/");   // notify.yml で指定（例：https://penchin1122.github.io/shin-board/）
@@ -128,6 +129,131 @@ export async function issueNotify(db, fcm, cfg, members) {
     if (n) await b.commit();
   }
   console.log(`未対応事項：${items.length}件を確認`);
+}
+
+/* ===================== Stripe 連携 =====================
+   ・GitHub Secrets の STRIPE_KEY（読み取り専用の制限付きキー）で、Stripe の取引と契約を読む
+   ・取引（売上・手数料・返金・入金）は、収支に暗号化して記録する（書き込み用の公開鍵で暗号化。読むにはボードの閲覧用パスワードが必要）
+   ・契約（サブスク）の数とMRRは、「自動入力：Stripe」を選んだKPIに書き込む
+   ・お客様の名前やメールアドレスは読まない・保存しない */
+const wc = globalThis.crypto.subtle;
+const b64 = buf => Buffer.from(buf).toString("base64");
+const unb64 = s => new Uint8Array(Buffer.from(s, "base64"));
+const EC = { name: "ECDH", namedCurve: "P-256" };
+export async function sealRecord(obj, pubB64) {
+  const pub = await wc.importKey("spki", unb64(pubB64), EC, false, []);
+  const eph = await wc.generateKey(EC, true, ["deriveBits"]);
+  const bits = new Uint8Array(await wc.deriveBits({ name: "ECDH", public: pub }, eph.privateKey, 256));
+  const epk = new Uint8Array(await wc.exportKey("raw", eph.publicKey));
+  const h = await wc.digest("SHA-256", new Uint8Array([...bits, ...epk]));
+  const key = await wc.importKey("raw", h, "AES-GCM", false, ["encrypt"]);
+  const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+  const ct = await wc.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(JSON.stringify(obj)));
+  return { v: 1, epk: b64(epk), iv: b64(iv), ct: b64(ct) };
+}
+const ZERO_DEC = ["jpy", "krw", "vnd", "clp", "pyg", "xof", "xaf", "ugx", "rwf", "kmf", "gnf", "djf", "bif", "mga", "vuv", "xpf"];
+const money = (v, cur) => ZERO_DEC.includes((cur || "jpy").toLowerCase()) ? v : v / 100;
+const jstDate = unix => localParts("Asia/Tokyo", new Date(unix * 1000)).date;
+async function stripeGet(path, params, key) {
+  const qs = new URLSearchParams(params).toString();
+  const res = await fetch(`https://api.stripe.com/v1/${path}?${qs}`, { headers: { Authorization: `Bearer ${key}` } });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(`Stripe ${res.status}: ${(j.error && j.error.message) || res.statusText}`), { status: res.status });
+  return j;
+}
+async function stripeAll(path, params, key, max = 2000) {
+  const out = []; let after = null;
+  for (;;) {
+    const j = await stripeGet(path, { ...params, limit: 100, ...(after ? { starting_after: after } : {}) }, key);
+    out.push(...j.data); if (!j.has_more || !j.data.length || out.length >= max) return out;
+    after = j.data[j.data.length - 1].id;
+  }
+}
+/* Stripe の取引1件 → 収支の記録（0〜2件）。売上は「総額」で収入、手数料は別の支出、入金は Stripe → 銀行 の振替 */
+export function btToRecords(bt, { account, payoutAccount, test }) {
+  const cur = bt.currency || "jpy"; const amt = money(bt.amount, cur), fee = money(bt.fee || 0, cur);
+  const date = jstDate(bt.created); const tag = test ? "【テスト】" : ""; const memo = (cur.toLowerCase() !== "jpy" ? `通貨：${cur.toUpperCase()}（換算前の金額）\n` : "") + `Stripe ${bt.type} ${bt.id}`;
+  const base = { date, owner: "Stripe", method: "Stripe", settled: "対象外", memo, account, fromAccount: "", toAccount: "" };
+  const recs = [];
+  const t = bt.type;
+  if (t === "charge" || t === "payment") recs.push({ id: bt.id, ...base, title: tag + "サブスク売上", type: "収入", category: "サブスク売上", amount: Math.abs(amt) });
+  else if (t === "refund" || t === "payment_refund") recs.push({ id: bt.id, ...base, title: tag + "返金", type: "支出", category: "返金", amount: Math.abs(amt) });
+  else if (t === "payout" || t === "payout_failure" || t === "payout_cancel") {
+    const out = amt < 0; recs.push({ id: bt.id, ...base, title: tag + (out ? "Stripeから銀行へ入金" : "入金の取り消し（Stripeに戻る）"), type: "振替", category: "振替", method: "", account: "", fromAccount: out ? account : payoutAccount, toAccount: out ? payoutAccount : account, amount: Math.abs(amt) });
+  }
+  else if (t === "stripe_fee" || t === "application_fee") recs.push({ id: bt.id, ...base, title: tag + "Stripe利用料", type: "支出", category: "支払手数料", amount: Math.abs(amt) });
+  else if (amt !== 0) recs.push({ id: bt.id, ...base, title: tag + `Stripe（${t}）`, type: amt > 0 ? "収入" : "支出", category: "その他", amount: Math.abs(amt) });
+  if (fee && t !== "stripe_fee") recs.push({ id: bt.id + "_fee", ...base, title: tag + "Stripe決済手数料", type: fee > 0 ? "支出" : "収入", category: "支払手数料", amount: Math.abs(fee) });
+  return recs;
+}
+/* KPIの区切り（第2・第4木曜と月末）。ボードの画面と同じ決め方 */
+export function meetingsOfMonth(m) {
+  const [y, mo] = m.split("-").map(Number); const first = new Date(Date.UTC(y, mo - 1, 1)); const off = (4 - first.getUTCDay() + 7) % 7;
+  const d = n => new Date(Date.UTC(y, mo - 1, n)).toISOString().slice(0, 10);
+  return [d(1 + off + 7), d(1 + off + 21), new Date(Date.UTC(y, mo, 0)).toISOString().slice(0, 10)];
+}
+const monthly = (price, qty) => { const r = price && price.recurring; if (!r || price.unit_amount == null) return 0; const a = money(price.unit_amount, price.currency) * (qty || 1) / (r.interval_count || 1);
+  return r.interval === "year" ? a / 12 : r.interval === "week" ? a * 52 / 12 : r.interval === "day" ? a * 365 / 12 : a; };
+export function subsMetrics(subs, today) {
+  const month = today.slice(0, 7); const cps = meetingsOfMonth(month); const cp = cps.find(x => x >= today) || cps[2];
+  const win = d => { const i = cps.findIndex(x => x >= d); return i < 0 ? null : cps[i]; };
+  const active = subs.filter(s => s.status === "active" || s.status === "past_due");
+  const mrr = Math.round(active.reduce((a, s) => a + (s.items && s.items.data || []).reduce((b, it) => b + monthly(it.price, it.quantity), 0) * (1 - ((s.discount && s.discount.coupon && s.discount.coupon.percent_off) || 0) / 100), 0));
+  const byCp = (list, f) => { const o = {}; list.forEach(s => { const d = f(s); if (d && d.slice(0, 7) === month) { const c = win(d); if (c) o[c] = (o[c] || 0) + 1; } }); return o; };
+  return {
+    cp, latest: { stripe_mrr: mrr, stripe_active: active.length },
+    sums: {
+      stripe_new: byCp(subs.filter(s => s.status !== "incomplete" && s.status !== "incomplete_expired"), s => jstDate(s.start_date || s.created)),
+      stripe_canceled: byCp(subs.filter(s => s.canceled_at || s.ended_at), s => jstDate(s.ended_at || s.canceled_at))
+    }
+  };
+}
+export async function stripeSync(db) {
+  const key = process.env.STRIPE_KEY;
+  const stateRef = db.doc("config/stripeState");
+  if (!key) { console.log("Stripe：STRIPE_KEY が未登録のため取り込みません"); return; }
+  const test = /^(rk|sk)_test_/.test(key);
+  const [cfgSnap, pubSnap, stSnap] = await Promise.all([db.doc("config/main").get(), db.doc("config/vaultPub").get(), stateRef.get()]);
+  const sc = (cfgSnap.exists && cfgSnap.data().stripe) || {};
+  const pub = pubSnap.exists && pubSnap.data().pub;
+  const st = stSnap.exists ? stSnap.data() : {};
+  const fail = async msg => { console.log("Stripe：" + msg); if (!DRY) await stateRef.set({ lastRun: new Date().toISOString(), lastError: msg, test }, { merge: true }); };
+  if (!pub) return fail("収支の暗号化がまだ設定されていません");
+  if (!sc.account || !sc.payoutAccount) return fail("ボードの収支画面で「Stripeの口座」と「入金先の口座」を選んでください");
+  try {
+    // 1) 取引 → 収支（同じ取引は2回記録しない：記録のIDを stripe_<取引ID> にする）
+    const since = st.cursor && st.mode === (test ? "test" : "live") ? st.cursor - 3600 : Math.floor(new Date((sc.since || localParts("Asia/Tokyo").date.slice(0, 8) + "01") + "T00:00:00+09:00").getTime() / 1000);
+    const bts = await stripeAll("balance_transactions", { "created[gte]": since }, key);
+    const recs = bts.flatMap(bt => btToRecords(bt, { account: sc.account, payoutAccount: sc.payoutAccount, test }));
+    let added = 0;
+    for (let i = 0; i < recs.length; i += 100) {
+      const chunk = recs.slice(i, i + 100); const refs = chunk.map(r => db.doc(`ledger/stripe_${r.id}`));
+      const snaps = await db.getAll(...refs); const b = db.batch(); let n = 0;
+      for (let k = 0; k < chunk.length; k++) {
+        if (snaps[k].exists) continue; const { id, ...plain } = chunk[k];
+        if (DRY) { console.log(`- 記録予定：${plain.date} ${plain.type} ${plain.title} ${plain.amount}`); continue; }
+        b.set(refs[k], { enc: await sealRecord(plain, pub), source: test ? "stripe-test" : "stripe", createdBy: "stripe", confirmed: true, hasReceipt: false, createdAt: FieldValue.serverTimestamp(), updatedBy: "stripe", updatedAt: FieldValue.serverTimestamp() }); n++;
+      }
+      if (n) { await b.commit(); added += n; }
+    }
+    const maxCreated = bts.reduce((a, b) => Math.max(a, b.created), st.mode === (test ? "test" : "live") ? (st.cursor || 0) : 0);
+    // 2) 契約 → KPI（「自動入力：Stripe」を選んだ今月のKPIだけ）
+    const subs = await stripeAll("subscriptions", { status: "all" }, key, 5000);
+    const today = localParts("Asia/Tokyo").date; const mtr = subsMetrics(subs, today);
+    const ks = await db.collection("kpis").where("month", "==", today.slice(0, 7)).get();
+    let kn = 0;
+    for (const d of ks.docs) {
+      const k = d.data(); if (!k.auto || !String(k.auto).startsWith("stripe_")) continue;
+      const args = [];
+      if (k.auto in mtr.latest) args.push(new FieldPath("weekly", mtr.cp), { value: mtr.latest[k.auto], by: "stripe" });
+      else for (const cp of meetingsOfMonth(today.slice(0, 7)).filter(x => x <= mtr.cp)) args.push(new FieldPath("weekly", cp), { value: (mtr.sums[k.auto] || {})[cp] || 0, by: "stripe" });
+      if (!DRY && args.length) await d.ref.update(...args); kn++;
+    }
+    console.log(`Stripe（${test ? "テスト" : "本番"}）：取引${bts.length}件 → 収支に${added}件追加 / 契約${subs.length}件 → KPI ${kn}件を更新（MRR ${mtr.latest.stripe_mrr}・有料会員 ${mtr.latest.stripe_active}）`);
+    if (!DRY) await stateRef.set({ lastRun: new Date().toISOString(), lastError: "", lastAdded: added, cursor: maxCreated || since, mode: test ? "test" : "live", test, metrics: { at: today, ...mtr.latest } }, { merge: true });
+  } catch (e) {
+    await fail(e.status === 401 ? "STRIPE_KEY が正しくありません" : e.status === 403 ? "キーの権限が足りません（" + e.message + "）" : e.message);
+  }
 }
 
 /* ===== 議事録のまとめ（Gemini） ===== */
@@ -273,6 +399,7 @@ async function main() {
     await sendTo(db, fcm, m.id, m.name, msg.title, msg.body, "morning");
   }
   await issueNotify(db, fcm, cfg, members);
+  await stripeSync(db).catch(e => console.log("Stripe：" + e.message));
   await summarizeMinutes(db, fcm);
 }
 
