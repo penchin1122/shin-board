@@ -792,3 +792,22 @@ dialog{overflow-x:hidden}
 .stripe-panel summary::-webkit-details-marker{display:none}
 .stripe-panel summary::before{content:"›";display:inline-block;transition:transform .2s;color:var(--muted);font-size:1.1rem}
 .stripe-panel[open] summary::before{transform:rotate(90deg)}
+
+/* ===== 並べ替えのつまみ（KPI・計測数値） ===== */
+.dhandle{flex:none;width:26px;height:30px;display:inline-grid;place-items:center;border:1px solid var(--line);border-radius:4px;background:var(--surface-2);color:var(--muted);cursor:grab;touch-action:none;user-select:none;padding:0;margin-right:8px;vertical-align:middle}
+.dhandle:active{cursor:grabbing}
+[data-drow].dragging{opacity:.95;box-shadow:0 6px 18px rgba(var(--shadow),.18);background:#FFFFFF;position:relative;z-index:3}
+.kname{display:inline-flex;align-items:center;flex-wrap:wrap;gap:2px 0}
+
+/* ===== 計測数値 ===== */
+.met-table td:first-child{min-width:16em;white-space:normal}
+.met-name{display:flex;align-items:center;gap:8px;min-width:0}
+.met-name > div{flex:1;min-width:0}
+.met-note{font-size:.75rem;line-height:1.5}
+.met-table input.cell{width:7em}
+.met-sp{display:none}
+.met-row{padding:10px 0;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:6px;background:#FFFFFF}
+.met-row:first-child{border-top:0}
+.met-in{display:flex;align-items:center;gap:8px;padding-left:34px}
+.met-in input.cell{flex:1;min-width:0;width:auto;font-size:16px;padding:8px;text-align:right}
+@media (max-width:600px){.met-pc{display:none}.met-sp{display:block}}

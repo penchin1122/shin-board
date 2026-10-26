@@ -85,10 +85,11 @@ const DEFAULT_KPIS = [];
 const KPI_TEMPLATES = DEFAULT_KPIS;
 const KPI_AUTO = [["", "しない（担当者が入力）"], ["stripe_mrr", "Stripe：MRR（月ごとの継続課金の売上）"], ["stripe_active", "Stripe：有料会員数"], ["stripe_new", "Stripe：新しく有料会員になった数"], ["stripe_canceled", "Stripe：解約した数"]];
 
-const TABS_ALL = [["home", "ホーム"], ["cal", "業務カレンダー"], ["kpi", "KPI"], ["forms", "フォーム"], ["templates", "テンプレ一覧"], ["minutes", "議事録"], ["money", "収支"], ["admin", "管理（設定・メンバー）"]];
+const TABS_ALL = [["home", "ホーム"], ["cal", "業務カレンダー"], ["kpi", "KPI"], ["metrics", "計測数値"], ["forms", "フォーム"], ["templates", "テンプレ一覧"], ["minutes", "議事録"], ["money", "収支"], ["admin", "管理（設定・メンバー）"]];
 const TAB_ICON = {
   home: '<path d="M3 11 12 4l9 7"/><path d="M5 10v10h14V10"/>',
   kpi: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+  metrics: '<path d="M3 3v18h18"/><path d="M7 15l4-5 3 3 5-6"/>',
   cal: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
   templates: '<path d="M4 5h16v11H8l-4 4z"/><path d="M8 9h8M8 12h5"/>',
   forms: '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/>',
@@ -100,7 +101,7 @@ const S = {
   user: null, member: null, isAdmin: false, dataKey: "",
   members: [], config: null, tasks: [], kpis: [], ledger: [],
   ready: {}, need: [],
-  tab: "home", adminSub: "settings", forms: [], kpiMonth: THISMONTH, calMonth: THISMONTH, repMonth: THISMONTH, tplCat: "all", selDay: TODAY, moneyMonth: THISMONTH,
+  tab: "home", adminSub: "settings", forms: [], kpiMonth: THISMONTH, metMonth: THISMONTH, calMonth: THISMONTH, repMonth: THISMONTH, tplCat: "all", selDay: TODAY, moneyMonth: THISMONTH,
   onlyMine: ls.get("shin_onlymine", "0") === "1"
 };
 let memberUnsub = null, permsUnsub = null, dataUnsubs = [];
@@ -119,11 +120,12 @@ const PERM_DEFS = [
   ["フォーム", [["forms_view", "見る"], ["forms_manage", "追加・編集"]]],
   ["テンプレ一覧", [["tpl_view", "見る"], ["tpl_add", "追加する（自分の分の編集）"], ["tpl_editAll", "全員の分を編集・削除"]]],
   ["議事録", [["min_view", "見る"], ["min_add", "追加する（自分の分の編集）"], ["min_editAll", "全員の分を編集・削除"]]],
+  ["計測数値", [["met_view", "見る"], ["met_edit", "項目の追加・数値の記入"]]],
   ["収支", [["fin_add", "記録を追加（自分が追加した記録だけ見られる）"], ["fin_view", "すべての記録と集計を見る（shincareer.com のアカウントのみ）"], ["fin_edit", "すべての記録を編集・削除（shincareer.com のアカウントのみ）"]]]
 ];
 const PERM_KEYS = PERM_DEFS.flatMap(([, a]) => a.map(([k]) => k));
 // オンにすると、前提になる項目も自動でオンにする（例：全員分の編集 → 登録 → 見る）
-const PERM_DEPS = { cal_add: ["cal_view"], cal_editAll: ["cal_add"], issue_editAll: ["issue_add"], kpi_manage: ["kpi_viewAll", "kpi_input"], forms_manage: ["forms_view"], tpl_add: ["tpl_view"], tpl_editAll: ["tpl_add"], min_add: ["min_view"], min_editAll: ["min_add"], fin_view: ["fin_add"], fin_edit: ["fin_view"] };
+const PERM_DEPS = { cal_add: ["cal_view"], cal_editAll: ["cal_add"], issue_editAll: ["issue_add"], kpi_manage: ["kpi_viewAll", "kpi_input"], forms_manage: ["forms_view"], tpl_add: ["tpl_view"], tpl_editAll: ["tpl_add"], min_add: ["min_view"], min_editAll: ["min_add"], fin_view: ["fin_add"], fin_edit: ["fin_view"], met_edit: ["met_view"] };
 const P = keys => Object.fromEntries(PERM_KEYS.map(k => [k, keys.includes(k)]));
 const DEFAULT_PERMS = {
   sub: P(PERM_KEYS.filter(k => k !== "fin_edit")),
@@ -152,7 +154,7 @@ const mColor = id => {
   return i < 0 ? "var(--muted)" : MEMBER_COLORS[i % MEMBER_COLORS.length];
 };
 const whoTag = id => `<span class="who" style="--mc:${mColor(id)}"><i></i>${esc(memName(id))}</span>`;
-const TAB_PERM = { cal: "cal_view", forms: "forms_view", templates: "tpl_view", minutes: "min_view" };
+const TAB_PERM = { metrics: "met_view", cal: "cal_view", forms: "forms_view", templates: "tpl_view", minutes: "min_view" };
 const tabsVisible = () => TABS_ALL.filter(([k]) => (k !== "money" || finAdd()) && (k !== "admin" || S.isAdmin) && (!TAB_PERM[k] || can(TAB_PERM[k])));
 
 /* ================= auth & data lifecycle ================= */
@@ -225,6 +227,8 @@ function startData() {
   listen("config", doc(db, "config", "main"), s => S.config = s.exists() ? s.data() : null);
   // 権限の表がまだ無ければ、管理者が初期値で作る（ルールはこの表を見て判断する）
   if (S.isAdmin && !S.perms) setDoc(doc(db, "config", "perms"), DEFAULT_PERMS).catch(e => console.warn("perms seed", e));
+  // 新しい機能の項目が表にまだ無ければ、初期値で足す（ルールは表に無い項目をオフとして扱うため）
+  else if (S.isAdmin && ROLES.some(([r]) => PERM_KEYS.some(k => !(k in ((S.perms || {})[r] || {}))))) setDoc(doc(db, "config", "perms"), Object.fromEntries(ROLES.map(([r]) => [r, permsOf(r)]))).catch(e => console.warn("perms fill", e));
   S.tasks = []; S.forms = []; S.minutes = []; S.templates = []; S.issues = [];
   if (can("cal_view")) listen("tasks", collection(db, "tasks"), s => S.tasks = docsOf(s));
   if (can("forms_view")) listen("forms", collection(db, "forms"), s => S.forms = docsOf(s));
@@ -232,6 +236,7 @@ function startData() {
   if (can("min_view")) listen("minutes", collection(db, "minutes"), s => S.minutes = docsOf(s));
   if (can("tpl_view")) listen("templates", collection(db, "templates"), s => S.templates = docsOf(s));
   if (S.isAdmin) listen("invites", collection(db, "invites"), s => S.invites = docsOf(s));
+  if (can("met_view")) listen("metrics", collection(db, "metrics"), s => S.metrics = docsOf(s));
   if (can("kpi_manage") || can("kpi_viewAll")) listen("kpis", collection(db, "kpis"), s => S.kpis = docsOf(s));
   else {
     // 一般メンバーは「全員に公開」「自分に公開」「自分が担当」のKPIだけを取得（ルール上それ以外は読めない）
@@ -439,8 +444,9 @@ function render() {
     return;
   }
   if (!S.need.length || !S.need.every(k => S.ready[k])) { if (!main.querySelector(".sk-wrap")) main.innerHTML = skeleton(S.tab); return; }
-  const views = { home: vHome, kpi: vKpi, cal: vCal, forms: vForms, money: vMoney, minutes: vMinutes, templates: vTemplates, admin: vAdmin };
+  const views = { home: vHome, kpi: vKpi, metrics: vMetrics, cal: vCal, forms: vForms, money: vMoney, minutes: vMinutes, templates: vTemplates, admin: vAdmin };
   if (S.tab === "admin" && S.adminSub === "settings" && (S.settingsDirty || S.dragging) && main.querySelector("[data-list]")) return;
+  if (S.dragging) return;   // 並べ替えの途中は描き直さない
   // パスワードを入力している途中は、データが更新されても画面を描き直さない
   const vp = main.querySelector(".vault-box #v-pass"); if (S.tab === "money" && vp && vp.value) return;
   const prevScroll = window.scrollY;
@@ -541,16 +547,16 @@ function vKpi() {
     const w = k.weekly || {}; const editable = can("kpi_manage") || (k.owner === uid() && can("kpi_input"));
     const tools = can("kpi_manage") ? `<div class="kpi-tools"><button class="link" type="button" data-act="kpi-edit" data-id="${esc(k.id)}">編集</button></div>` : "";
     const tgt = Number(k.target) > 0 ? `目標 ${num(k.target)}${esc(k.unit || "")}` : "目標未設定";
-    return `<tr><td><span class="kname"><b>${esc(k.name)}</b>${isTrack(k) ? ` <span class="pill plain">記録のみ</span>` : ""}${k.auto ? ` <span class="pill info">Stripeから自動</span>` : ""}</span><div class="muted" style="font-size:.75rem">${esc(memName(k.owner))}・${k.mode === "latest" ? "最新値" : "合計"}・${tgt}</div>${tools}</td>
+    return `<tr data-drow="${esc(k.id)}"><td><span class="kname">${can("kpi_manage") ? dragHandle(k.name) : ""}<b>${esc(k.name)}</b>${isTrack(k) ? ` <span class="pill plain">記録のみ</span>` : ""}${k.auto ? ` <span class="pill info">Stripeから自動</span>` : ""}</span><div class="muted" style="font-size:.75rem">${esc(memName(k.owner))}・${k.mode === "latest" ? "最新値" : "合計"}・${tgt}</div>${tools}</td>
       ${weeks.map(wk => { const v = w[wk] && w[wk].value !== null && w[wk].value !== undefined ? w[wk].value : "";
         return `<td class="num${wk === NEXTMTG ? " now" : ""}" data-label="${ckHead(wk)}" data-short="${mtgLabel(wk)}締め">${editable && !k.auto ? `<input class="cell" id="c-${esc(k.id)}-${wk}" type="number" inputmode="decimal" step="any" aria-label="${esc(k.name)} ${mtgLabel(wk)} ${md(wk)}" data-act="kpi-cell" data-id="${esc(k.id)}" data-wk="${wk}" value="${esc(v)}">` : (v === "" ? `<span class="muted">—</span>` : num(v))}</td>`; }).join("")}</tr>`;
   }).join("");
   return head + `<section class="panel kpi-entry"><h3>10日・20日・月末の進捗入力<span class="hint hide-sm">進捗はホームで確認</span></h3>
-      <p class="kpi-note">毎月10日・20日・月末に、担当者が実績を入力します。入力すると自動で保存されます。</p>
+      <p class="kpi-note">毎月10日・20日・月末に、担当者が実績を入力します。入力すると自動で保存されます。${can("kpi_manage") ? "左のつまみをドラッグすると、KPIの順番を変えられます（ホームの表示順も変わります）。" : ""}</p>
       <details class="kpi-rule"><summary>何を入れればいい？</summary><ul>
         <li><b>最新値</b>：その時点の数（例：フォロワー数）</li>
         <li><b>合計</b>：前回から増えた分（10日＝1日〜10日／20日＝11日〜20日／月末＝21日〜月末）</li></ul></details>
-      <div class="tablewrap"><table><thead><tr><th>指標</th>${weeks.map(wk => `<th class="num${wk === NEXTMTG ? " now" : ""}">${ckHead(wk)}${wk === NEXTMTG ? "<br>次回" : ""}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table></div>
+      <div class="tablewrap"><table><thead><tr><th>指標</th>${weeks.map(wk => `<th class="num${wk === NEXTMTG ? " now" : ""}">${ckHead(wk)}${wk === NEXTMTG ? "<br>次回" : ""}</th>`).join("")}</tr></thead><tbody data-dkind="kpis">${rows}</tbody></table></div>
     </section>`;
 }
 
@@ -905,6 +911,72 @@ function stripePanel() {
     <p style="margin:10px 0 0;display:flex;gap:10px;flex-wrap:wrap"><button class="btn small" type="button" data-act="stripe-save">保存</button>${tests ? `<button class="btn sec small danger-sec" type="button" data-act="stripe-del-test">${S.armDel === "stripe-test" ? `本当に削除する（${tests}件）` : `テストの記録を削除（${tests}件）`}</button>` : ""}</p>
     <p class="muted" style="font-size:.75rem;margin:8px 0 0">お客様の名前やメールアドレスは読み込みません。取り込む記録には「領収書なし」は出ません。</p></details>`;
 }
+
+/* ===================== 計測数値：月に1回、その月の数値を記入する（副管理者以上） ===================== */
+const metList = () => [...(S.metrics || [])].sort((a, b) => (a.order || 0) - (b.order || 0));
+const metVal = (m, mo) => { const v = (m.values || {})[mo]; return v === null || v === undefined || v === "" ? null : Number(v); };
+const dragHandle = label => `<button type="button" class="dhandle" aria-label="${esc(label)}を並べ替え（↑↓キーで移動）" title="ドラッグして並べ替え"><svg width="12" height="18" viewBox="0 0 12 18" aria-hidden="true" fill="currentColor"><circle cx="3" cy="3" r="1.6"/><circle cx="9" cy="3" r="1.6"/><circle cx="3" cy="9" r="1.6"/><circle cx="9" cy="9" r="1.6"/><circle cx="3" cy="15" r="1.6"/><circle cx="9" cy="15" r="1.6"/></svg></button>`;
+function vMetrics() {
+  const list = metList(); const ed = can("met_edit"); const end = S.metMonth;
+  const months = Array.from({ length: 6 }, (_, i) => shiftMonth(end, i - 5));
+  const head = `<div class="bar"><h2 class="vh">計測数値</h2>${monthNav("metMonth")}${ed ? `<button class="btn" type="button" data-act="met-new">項目を追加</button>` : ""}</div>
+    <p class="muted" style="font-size:.85rem;margin:-8px 0 14px">月に1回、その月の数値を記入します。見られるのは副管理者以上だけです。${ed ? "左のつまみをドラッグすると、項目の順番を変えられます。" : ""}</p>`;
+  if (!list.length) return head + `<div class="empty"><p>まだ項目がありません。</p>${ed ? `<button class="btn small" type="button" data-act="met-new">最初の項目を追加</button>` : ""}</div>`;
+  const cell = (m, mo) => { const v = metVal(m, mo);
+    return ed ? `<input class="cell" type="number" inputmode="decimal" step="any" data-act="met-cell" data-id="${esc(m.id)}" data-m="${mo}" value="${v === null ? "" : esc(v)}" aria-label="${esc(m.name)} ${monthLabel(mo)}">` : (v === null ? `<span class="muted">—</span>` : num(v)); };
+  const delta = (m, mo) => { const a = metVal(m, mo), b = metVal(m, shiftMonth(mo, -1)); if (a === null || b === null) return ""; const d = a - b; return `<span class="delta ${d > 0 ? "up" : d < 0 ? "down" : ""}">${d > 0 ? "+" : d < 0 ? "−" : "±"}${num(Math.abs(d))}${esc(m.unit || "")}</span>`; };
+  const nameCell = m => `<div class="met-name">${ed ? dragHandle(m.name) : ""}<div><b>${esc(m.name)}</b>${m.unit ? `<span class="muted">（${esc(m.unit)}）</span>` : ""}${m.note ? `<div class="muted met-note">${esc(m.note)}</div>` : ""}</div>${ed ? `<button class="link" type="button" data-act="met-edit" data-id="${esc(m.id)}">編集</button>` : ""}</div>`;
+  return head + `<section class="panel met-pc"><div class="tablewrap"><table class="met-table"><thead><tr><th>項目</th>${months.map(mo => `<th class="num${mo === THISMONTH ? " now" : ""}">${mo.slice(0, 4) !== end.slice(0, 4) || mo.endsWith("-01") ? mo.slice(0, 4) + "年" : ""}${Number(mo.slice(5))}月</th>`).join("")}</tr></thead>
+      <tbody data-dkind="metrics">${list.map(m => `<tr data-drow="${esc(m.id)}"><td>${nameCell(m)}</td>${months.map(mo => `<td class="num${mo === THISMONTH ? " now" : ""}">${cell(m, mo)}</td>`).join("")}</tr>`).join("")}</tbody></table></div></section>
+    <section class="panel met-sp"><h3>${monthLabel(end)}</h3><div data-dkind="metrics">${list.map(m => `<div class="met-row" data-drow="${esc(m.id)}">${nameCell(m)}<div class="met-in">${cell(m, end)}${delta(m, end)}</div></div>`).join("")}</div></section>`;
+}
+function metricDialog(m) {
+  const v = m || { name: "", unit: "", note: "" };
+  const body = fld("項目名", `<input name="name" id="f-name" required maxlength="40" value="${esc(v.name)}" placeholder="例：面接練習の平均時間">`, { full: true, req: true }) +
+    fld("単位", `<input name="unit" id="f-unit" maxlength="10" value="${esc(v.unit || "")}" placeholder="例：分・人・%・円">`) +
+    fld("計測方法のメモ（任意）", `<textarea name="note" id="f-note" placeholder="例：管理画面の月次レポートから転記">${esc(v.note || "")}</textarea>`, { full: true });
+  openDlg(m ? "項目を編集" : "項目を追加", body, {
+    submit: async f => {
+      const data = { name: f.name.trim(), unit: f.unit.trim(), note: f.note.trim() };
+      if (!data.name) return showErr("項目名を入力してください。"), false;
+      if (m) await updateDoc(doc(db, "metrics", m.id), data);
+      else { Object.assign(data, { values: {}, order: Date.now(), createdBy: uid(), createdAt: serverTimestamp() }); await addDoc(collection(db, "metrics"), data); S.anim = "in"; }
+    },
+    del: m ? () => deleteDoc(doc(db, "metrics", m.id)) : null,
+    delInBody: m ? { label: "この項目を削除", help: "記入した数値も一緒に消えます。元に戻せません" } : null
+  });
+}
+/* ===== 並べ替え（KPI・計測数値）：つまみをドラッグ、またはつまみを選んで↑↓キー。離したときに順番を保存 ===== */
+async function saveOrder(box) {
+  const kind = box.dataset.dkind; const ids = [...box.children].filter(r => r.dataset && r.dataset.drow).map(r => r.dataset.drow);
+  const list = kind === "kpis" ? S.kpis : S.metrics; const b = writeBatch(db); let n = 0;
+  ids.forEach((id, i) => { const it = (list || []).find(x => x.id === id); if (it && it.order !== i + 1) { b.update(doc(db, kind, id), { order: i + 1 }); it.order = i + 1; n++; } });
+  if (!n) return;
+  try { await b.commit(); toast("並び順を保存しました"); } catch (e) { toast(errMsg(e), "error"); render(); }
+}
+document.addEventListener("pointerdown", e => {
+  const h = e.target.closest(".dhandle"); if (!h || e.button > 0) return;
+  const row = h.closest("[data-drow]"); const box = row && row.parentElement; if (!box || !box.dataset.dkind) return;
+  e.preventDefault(); S.dragging = true; row.classList.add("dragging");
+  const move = ev => {
+    if (ev.pointerId !== e.pointerId) return;
+    const others = [...box.children].filter(r => r !== row && r.dataset.drow);
+    const before = others.find(r => { const b = r.getBoundingClientRect(); return ev.clientY < b.top + b.height / 2; });
+    if (before) { if (row.nextElementSibling !== before) box.insertBefore(row, before); } else if (box.lastElementChild !== row) box.appendChild(row);
+  };
+  const end = ev => {
+    if (ev.pointerId !== e.pointerId) return;
+    document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", end); document.removeEventListener("pointercancel", end);
+    row.classList.remove("dragging"); S.dragging = false; h.focus({ preventScroll: true }); saveOrder(box).then(() => render());
+  };
+  document.addEventListener("pointermove", move); document.addEventListener("pointerup", end); document.addEventListener("pointercancel", end);
+});
+document.addEventListener("keydown", e => {
+  const h = e.target.closest && e.target.closest(".dhandle"); if (!h || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+  const row = h.closest("[data-drow]"), box = row.parentElement; e.preventDefault();
+  const sib = e.key === "ArrowUp" ? row.previousElementSibling : row.nextElementSibling; if (!sib || !sib.dataset.drow) return;
+  e.key === "ArrowUp" ? box.insertBefore(row, sib) : box.insertBefore(sib, row); h.focus(); saveOrder(box);
+});
 
 const canEditLed = r => finEdit() || (r.createdBy === uid() && finAdd());
 const ledStatus = r => r.confirmed ? `<span class="pill good">確認済</span>` : `<span class="pill plain">未確認</span>`;
@@ -1880,6 +1952,8 @@ document.addEventListener("click", async e => {
   if (act === "go") { if (dlg.open) closeDlg(); S.anim = "in"; S.tab = a.dataset.tab; render(); window.scrollTo(0, 0); return; }
   if (act === "mprev" || act === "mnext") { const k = a.dataset.k; S.anim = act === "mprev" ? "r" : "l"; S[k] = shiftMonth(S[k], act === "mprev" ? -1 : 1); if (k === "calMonth") S.selDay = S.calMonth === THISMONTH ? TODAY : S.calMonth + "-01"; render(); return; }
   if (act === "kpi-new") return kpiDialog(null);
+  if (act === "met-new") { if (can("met_edit")) metricDialog(null); return; }
+  if (act === "met-edit") { const m = (S.metrics || []).find(x => x.id === id); if (m && can("met_edit")) metricDialog(m); return; }
   if (act === "kpi-tpl") return kpiDialog(null, KPI_TEMPLATES[+a.dataset.i]);
   if (act === "kpi-edit") return kpiDialog(S.kpis.find(k => k.id === id));
   if (act === "kpi-del") {
@@ -1991,6 +2065,7 @@ document.addEventListener("change", async e => {
       await new Promise(r => setTimeout(r, reducedMotion() ? 0 : 380));
       await updateDoc(doc(db, "tasks", id), { done: a.checked });
     }
+    if (act === "met-cell") { const raw = a.value.trim(); await updateDoc(doc(db, "metrics", id), new FieldPath("values", a.dataset.m), raw === "" ? null : Number(raw)); toast("保存しました"); }
     if (act === "kpi-cell") { const raw = a.value.trim(); await updateDoc(doc(db, "kpis", id), new FieldPath("weekly", a.dataset.wk), { value: raw === "" ? null : Number(raw), by: uid() }); toast("保存しました"); }
     if (act === "mem-name") { await updateDoc(doc(db, "members", id), { name: a.value.trim() }); toast("表示名を保存しました"); }
     if (act === "mem-role") { await updateDoc(doc(db, "members", id), { role: a.value }); toast(memName(id) + "さんを「" + roleLabel(a.value) + "」にしました"); }
