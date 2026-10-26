@@ -22,15 +22,14 @@ const shiftMonth = (m, k) => { const d = parse(m + "-01"); d.setMonth(d.getMonth
 /* カレンダーは日曜始まり */
 const weekStart = d => { const x = new Date(d); x.setDate(x.getDate() - x.getDay()); return x; };
 const daysBetween = (a, b) => Math.round((parse(b) - parse(a)) / 86400000);
-// 定例ミーティング：毎月 第2・第4木曜日。KPIの進捗はこの2回の時点で入力する
+// KPIの区切り：毎月 10日・20日・月末。進捗はこの3回の時点で入力する（ミーティングの日とは関係なく固定）
 function meetingsOfMonth(m) {
-  const first = parse(m + "-01"); const off = (4 - first.getDay() + 7) % 7; // 最初の木曜日
-  const y = first.getFullYear(), mo = first.getMonth();
-  return [ymd(new Date(y, mo, 1 + off + 7)), ymd(new Date(y, mo, 1 + off + 21)), ymd(new Date(y, mo + 1, 0))]; // 第2木・第4木・月末
+  const first = parse(m + "-01"); const y = first.getFullYear(), mo = first.getMonth();
+  return [ymd(new Date(y, mo, 10)), ymd(new Date(y, mo, 20)), ymd(new Date(y, mo + 1, 0))]; // 10日・20日・月末
 }
 const NEXTMTG = [...meetingsOfMonth(THISMONTH), ...meetingsOfMonth(shiftMonth(THISMONTH, 1))].find(x => x >= TODAY);
-const mtgLabel = d => { const mt = meetingsOfMonth(d.slice(0, 7)); return mt[0] === d ? "第2木" : mt[1] === d ? "第4木" : "月末"; };
-const mtgName = d => mtgLabel(d) === "月末" ? "月末" : "MTG";
+const ckHead = d => mtgLabel(d) === "月末" ? `月末締め（${Number(d.slice(8, 10))}日）` : mtgLabel(d) + "締め";
+const mtgLabel = d => { const mt = meetingsOfMonth(d.slice(0, 7)); return mt[0] === d ? "10日" : mt[1] === d ? "20日" : "月末"; };
 const ls = { get(k, d) { try { return localStorage.getItem(k) ?? d; } catch (e) { return d; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) { } } };
 /* 拡大・縮小させない（スマホの2本指拡大・ダブルタップ拡大を止める） */
 try { localStorage.removeItem("uiZoom"); } catch (_) { }
@@ -319,7 +318,7 @@ function kpiRow(k, withEdit) {
     <div class="name">${esc(k.name)} <span class="pill ${s.st.c}">${s.st.t}</span>${tools}</div>
     <div class="nums">${s.t > 0 ? `<b>${cu(s.a.v, "num")}</b> / ${num(s.t)}${esc(k.unit || "")} <span class="muted">（${Math.round(s.rate * 100)}%）</span>` : `<b>${num(s.a.v)}</b>${esc(k.unit || "")} <span class="muted">／ 目標未設定</span>`}</div>
     <div class="meter"><i class="${cls}" style="width:${w}%"></i>${pace}</div>
-    <div class="meta"><span>担当：${whoTag(k.owner)}</span><span>${k.mode === "latest" ? "最新値で集計" : "MTG・月末ごとの合計で集計"}</span>${k.month === THISMONTH && s.t > 0 ? `<span>今日時点の目安：${num(s.t * s.el)}${esc(k.unit || "")}</span>` : ""}${can("kpi_manage") ? `<span>${esc(viewersLabel(k))}</span>` : ""}</div>
+    <div class="meta"><span>担当：${whoTag(k.owner)}</span><span>${k.mode === "latest" ? "最新値で集計" : "10日・20日・月末ごとの合計で集計"}</span>${k.month === THISMONTH && s.t > 0 ? `<span>今日時点の目安：${num(s.t * s.el)}${esc(k.unit || "")}</span>` : ""}${can("kpi_manage") ? `<span>${esc(viewersLabel(k))}</span>` : ""}</div>
   </div>`;
 }
 
@@ -503,13 +502,13 @@ function vHome() {
   const ks = S.kpis.filter(k => k.month === THISMONTH).sort((a, b) => (a.order || 0) - (b.order || 0));
   const untilMtg = daysBetween(TODAY, NEXTMTG);
   const mtgKpis = S.kpis.filter(k => k.month === NEXTMTG.slice(0, 7));
-  const myKpiNoReport = untilMtg <= 7 && can("kpi_input") ? mtgKpis.filter(k => k.owner === uid() && !((k.weekly || {})[NEXTMTG] && (k.weekly || {})[NEXTMTG].value !== null)) : [];
+  const myKpiNoReport = untilMtg <= 3 && can("kpi_input") ? mtgKpis.filter(k => k.owner === uid() && !((k.weekly || {})[NEXTMTG] && (k.weekly || {})[NEXTMTG].value !== null)) : [];
   return `<div class="bar"><h2>${md(TODAY)}</h2><span class="muted">${esc(memName(uid()))}さん</span></div>
   <div class="grid2 home-grid">
     <div class="stack">
       <section class="panel"><h3>今日やること<span class="hint">${myOpen ? `残り${myOpen}件` : ""}</span></h3>
         ${myOpen ? mine.filter(t => !t.done).map(t => taskItem(t)).join("") : `<p class="muted" style="margin:0">${mine.length ? "今日の業務はすべて完了しました。" : "今日の業務はありません。"}</p>`}
-        ${myKpiNoReport.length ? `<div class="banner" style="margin:12px 0 0">${untilMtg === 0 ? "今日" : untilMtg === 1 ? "明日" : untilMtg + "日後"}の${mtgName(NEXTMTG) === "月末" ? "月末締め" : "MTG"}（${md(NEXTMTG)}）までにKPIの報告をお願いします：${myKpiNoReport.map(k => esc(k.name)).join("、")} <button class="link" type="button" data-act="go" data-tab="kpi">入力する</button></div>` : ""}
+        ${myKpiNoReport.length ? `<div class="banner" style="margin:12px 0 0">${untilMtg === 0 ? "今日" : untilMtg === 1 ? "明日" : untilMtg + "日後"}の${mtgLabel(NEXTMTG)}締め（${md(NEXTMTG)}）までにKPIの報告をお願いします：${myKpiNoReport.map(k => esc(k.name)).join("、")} <button class="link" type="button" data-act="go" data-tab="kpi">入力する</button></div>` : ""}
       </section>
       <section class="panel"><h3>未対応（全体共有）<span class="hint">${openIssues.length + overdue.length}件</span>${can("issue_add") ? `<button class="btn small" type="button" data-act="issue-new">＋ 追加</button>` : ""}</h3>
         ${openIssues.length ? openIssues.map(issueItem).join("") : ""}
@@ -544,14 +543,14 @@ function vKpi() {
     const tgt = Number(k.target) > 0 ? `目標 ${num(k.target)}${esc(k.unit || "")}` : "目標未設定";
     return `<tr><td><span class="kname"><b>${esc(k.name)}</b>${isTrack(k) ? ` <span class="pill plain">記録のみ</span>` : ""}${k.auto ? ` <span class="pill info">Stripeから自動</span>` : ""}</span><div class="muted" style="font-size:.75rem">${esc(memName(k.owner))}・${k.mode === "latest" ? "最新値" : "合計"}・${tgt}</div>${tools}</td>
       ${weeks.map(wk => { const v = w[wk] && w[wk].value !== null && w[wk].value !== undefined ? w[wk].value : "";
-        return `<td class="num${wk === NEXTMTG ? " now" : ""}" data-label="${mtgLabel(wk)} ${md(wk).replace(/\(.\)/, "")}" data-short="${mtgLabel(wk)}">${editable && !k.auto ? `<input class="cell" id="c-${esc(k.id)}-${wk}" type="number" inputmode="decimal" step="any" aria-label="${esc(k.name)} ${mtgLabel(wk)} ${md(wk)}" data-act="kpi-cell" data-id="${esc(k.id)}" data-wk="${wk}" value="${esc(v)}">` : (v === "" ? `<span class="muted">—</span>` : num(v))}</td>`; }).join("")}</tr>`;
+        return `<td class="num${wk === NEXTMTG ? " now" : ""}" data-label="${ckHead(wk)}" data-short="${mtgLabel(wk)}締め">${editable && !k.auto ? `<input class="cell" id="c-${esc(k.id)}-${wk}" type="number" inputmode="decimal" step="any" aria-label="${esc(k.name)} ${mtgLabel(wk)} ${md(wk)}" data-act="kpi-cell" data-id="${esc(k.id)}" data-wk="${wk}" value="${esc(v)}">` : (v === "" ? `<span class="muted">—</span>` : num(v))}</td>`; }).join("")}</tr>`;
   }).join("");
-  return head + `<section class="panel kpi-entry"><h3>MTG・月末ごとの進捗入力<span class="hint hide-sm">進捗はホームで確認</span></h3>
-      <p class="kpi-note">第2・第4木曜のMTGと月末に、担当者が実績を入力します。入力すると自動で保存されます。</p>
+  return head + `<section class="panel kpi-entry"><h3>10日・20日・月末の進捗入力<span class="hint hide-sm">進捗はホームで確認</span></h3>
+      <p class="kpi-note">毎月10日・20日・月末に、担当者が実績を入力します。入力すると自動で保存されます。</p>
       <details class="kpi-rule"><summary>何を入れればいい？</summary><ul>
         <li><b>最新値</b>：その時点の数（例：フォロワー数）</li>
-        <li><b>合計</b>：前回から増えた分（第2木＝月初から／第4木＝第2木の翌日から／月末＝第4木の翌日から）</li></ul></details>
-      <div class="tablewrap"><table><thead><tr><th>指標</th>${weeks.map(wk => `<th class="num${wk === NEXTMTG ? " now" : ""}">${mtgLabel(wk)} ${md(wk).replace(/\(.\)/, "")}${wk === NEXTMTG ? "<br>次回" : ""}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table></div>
+        <li><b>合計</b>：前回から増えた分（10日＝1日〜10日／20日＝11日〜20日／月末＝21日〜月末）</li></ul></details>
+      <div class="tablewrap"><table><thead><tr><th>指標</th>${weeks.map(wk => `<th class="num${wk === NEXTMTG ? " now" : ""}">${ckHead(wk)}${wk === NEXTMTG ? "<br>次回" : ""}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table></div>
     </section>`;
 }
 
@@ -1105,7 +1104,7 @@ function vMinuteDetail(m) {
       <details class="panel min-raw"><summary>文字起こしの原文を見る（${num((m.transcript || "").length)}文字）</summary><div class="min-raw-text">${esc(m.transcript || "")}</div></details></div>`;
 }
 function minuteDialog() {
-  const body = fld("MTGの日付", `<input type="date" name="date" id="f-date" required value="${esc(NEXTMTG && NEXTMTG <= TODAY ? NEXTMTG : TODAY)}">`, { full: true, req: true }) +
+  const body = fld("MTGの日付", `<input type="date" name="date" id="f-date" required value="${esc(TODAY)}">`, { full: true, req: true }) +
     `<div class="field full"><span class="lbl">文字起こし<span class="req">必須</span></span><textarea name="transcript" id="f-transcript" rows="8" placeholder="MTGの音声を文字起こししたものを、そのまま貼り付けてください" style="min-height:160px"></textarea>
       <span class="help">iPhoneのボイスメモの「文字起こし」や、LINE・Googleドキュメントの音声入力の結果をそのまま貼ってOKです。えーと・あの等は自動で取り除かれます。<label class="link" style="cursor:pointer">テキストファイルから読み込む<input type="file" id="f-txt" accept=".txt,text/plain" hidden></label></span></div>` +
     moreBtn("タイトルを付ける（空欄なら自動で付きます）") +
@@ -1435,14 +1434,14 @@ function sheetContent(sh) {
     const k = S.kpis.find(x => x.id === sh.id); if (!k) return null;
     const w = k.weekly || {}; const weeks = meetingsOfMonth(k.month);
     const rows = weeks.map(wk => { const v = w[wk] && w[wk].value !== null && w[wk].value !== undefined ? w[wk].value : null;
-      return `<div class="kd-row${wk === NEXTMTG ? " now" : ""}"><span>${mtgLabel(wk)}（${md(wk)}）${wk === NEXTMTG ? `<span class="pill plain">次回</span>` : ""}</span><b>${v === null ? `<span class="muted">未入力</span>` : num(v) + esc(k.unit || "")}</b></div>`; }).join("");
+      return `<div class="kd-row${wk === NEXTMTG ? " now" : ""}"><span>${ckHead(wk)}${wk === NEXTMTG ? `<span class="pill plain">次回</span>` : ""}</span><b>${v === null ? `<span class="muted">未入力</span>` : num(v) + esc(k.unit || "")}</b></div>`; }).join("");
     let head;
     if (isTrack(k)) { const t = trackInfo(k); head = `<div class="kd-big"><b>${t.last ? num(t.last.v) : "—"}</b>${Number(k.target) > 0 ? ` / ${num(k.target)}` : ""}${esc(k.unit || "")} ${t.last ? deltaTag(t, k.unit) : ""}</div>`; }
     else { const st = kpiStatus(k); head = `<div class="kd-big"><b>${num(st.a.v)}</b> / ${st.t > 0 ? num(st.t) : "—"}${esc(k.unit || "")} ${st.t > 0 ? `<span class="pill ${st.st.c}">${Math.round(st.rate * 100)}%</span>` : ""}</div>
       ${st.t > 0 ? `<div class="meter"><i class="${st.st.c === "good" ? "good" : (st.st.c === "warn" || st.st.c === "bad") ? "warn" : ""}" style="width:${Math.min(100, st.rate * 100)}%"></i></div>` : ""}`; }
     const canIn = can("kpi_manage") || (k.owner === uid() && can("kpi_input"));
     return { title: k.name, body: `${head}
-      <div class="kd-meta"><span>担当：${whoTag(k.owner)}</span><span>${isTrack(k) ? "記録のみ（最新値）" : k.mode === "latest" ? "最新値で集計" : "MTG・月末ごとの合計"}</span></div>
+      <div class="kd-meta"><span>担当：${whoTag(k.owner)}</span><span>${isTrack(k) ? "記録のみ（最新値）" : k.mode === "latest" ? "最新値で集計" : "10日・20日・月末ごとの合計"}</span></div>
       <div class="kd-list">${rows}</div>`,
       foot: canIn ? `<div class="sp"><button class="btn" type="button" data-act="go" data-tab="kpi">進捗を入力する</button></div>` : "" };
   }
@@ -1572,9 +1571,9 @@ function kpiDialog(k, preset) {
     `<div class="field full"><label class="checks" style="font-size:.88rem"><input type="checkbox" name="track" id="f-track" value="1" ${trk ? "checked" : ""}>記録のみの指標にする（フォロワー数など。達成率とゲージを出さず、「最新値／目標」と前回からの増減を表示）</label></div>` +
     `<div class="field" id="target-field"><span class="lbl">月次目標<span class="req" id="target-req">必須</span><span class="muted" id="target-opt" style="font-weight:400;margin-left:4px">（任意）</span></span><input name="target" id="f-target" type="number" step="any" min="0" value="${esc(v.target ?? "")}"></div>` +
     fld("単位", `<input name="unit" id="f-unit" value="${esc(v.unit || "")}" placeholder="人・回・件">`) +
-    fld("自動入力", sel("auto", KPI_AUTO, v.auto || ""), { full: true, help: "Stripeを選ぶと、MTG・月末ごとの値を10分おきに自動で入れます（手で入力する欄は出なくなります）" }) +
-    fld("集計方法", sel("mode", [["sum", "合計（MTG・月末ごとに、前回から増えた分を入力）"], ["latest", "最新値（MTG・月末時点の数値を入力）"]], v.mode), { full: true }) +
-    fld("担当者", memberChips("owner", [v.owner], { multi: false }), { full: true, help: "MTGと月末に進捗を入力する人（1人）" }) +
+    fld("自動入力", sel("auto", KPI_AUTO, v.auto || ""), { full: true, help: "Stripeを選ぶと、10日・20日・月末ごとの値を10分おきに自動で入れます（手で入力する欄は出なくなります）" }) +
+    fld("集計方法", sel("mode", [["sum", "合計（10日・20日・月末ごとに、前回から増えた分を入力）"], ["latest", "最新値（10日・20日・月末時点の数値を入力）"]], v.mode), { full: true }) +
+    fld("担当者", memberChips("owner", [v.owner], { multi: false }), { full: true, help: "10日・20日・月末に進捗を入力する人（1人）" }) +
     fld("対象月", `<input name="month" id="f-month" type="month" required value="${esc(v.month)}">`, { req: true }) +
     shareBox("viewers", v.viewers, "担当者には常に表示されます。表示できない人には、このKPIのデータ自体が送られません。");
   openDlg(k ? "KPIを編集" : "KPIを追加", body, {
@@ -1590,7 +1589,7 @@ function kpiDialog(k, preset) {
       else { data.weekly = {}; data.order = Date.now(); data.createdAt = serverTimestamp(); await addDoc(collection(db, "kpis"), data); }
     },
     del: k ? () => deleteDoc(doc(db, "kpis", k.id)) : null,
-    delInBody: k ? { label: "このKPIを削除", help: "MTG・月末ごとに入力した進捗も一緒に消えます。元に戻せません" } : null
+    delInBody: k ? { label: "このKPIを削除", help: "10日・20日・月末ごとに入力した進捗も一緒に消えます。元に戻せません" } : null
   });
   wireShare("viewers");
   const tc = form.querySelector("#f-track"), tf = form.querySelector("#target-field");

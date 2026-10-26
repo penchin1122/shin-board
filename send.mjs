@@ -186,11 +186,10 @@ export function btToRecords(bt, { account, payoutAccount, test }) {
   if (fee && t !== "stripe_fee") recs.push({ id: bt.id + "_fee", ...base, title: tag + "Stripe決済手数料", type: fee > 0 ? "支出" : "収入", category: "支払手数料", amount: Math.abs(fee) });
   return recs;
 }
-/* KPIの区切り（第2・第4木曜と月末）。ボードの画面と同じ決め方 */
+/* KPIの区切り（毎月10日・20日・月末）。ボードの画面と同じ決め方 */
 export function meetingsOfMonth(m) {
-  const [y, mo] = m.split("-").map(Number); const first = new Date(Date.UTC(y, mo - 1, 1)); const off = (4 - first.getUTCDay() + 7) % 7;
-  const d = n => new Date(Date.UTC(y, mo - 1, n)).toISOString().slice(0, 10);
-  return [d(1 + off + 7), d(1 + off + 21), new Date(Date.UTC(y, mo, 0)).toISOString().slice(0, 10)];
+  const [y, mo] = m.split("-").map(Number);
+  return [`${m}-10`, `${m}-20`, new Date(Date.UTC(y, mo, 0)).toISOString().slice(0, 10)];
 }
 const monthly = (price, qty) => { const r = price && price.recurring; if (!r || price.unit_amount == null) return 0; const a = money(price.unit_amount, price.currency) * (qty || 1) / (r.interval_count || 1);
   return r.interval === "year" ? a / 12 : r.interval === "week" ? a * 52 / 12 : r.interval === "day" ? a * 365 / 12 : a; };
