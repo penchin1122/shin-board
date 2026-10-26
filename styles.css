@@ -811,3 +811,4 @@ dialog{overflow-x:hidden}
 .met-in{display:flex;align-items:center;gap:8px;padding-left:34px}
 .met-in input.cell{flex:1;min-width:0;width:auto;font-size:16px;padding:8px;text-align:right}
 @media (max-width:600px){.met-pc{display:none}.met-sp{display:block}}
+.met-caution{margin:0 0 14px;padding:8px 12px;border-left:3px solid var(--accent);background:var(--accent-soft);color:var(--navy);font-size:.85rem;border-radius:0 6px 6px 0}

@@ -101,7 +101,7 @@ const S = {
   user: null, member: null, isAdmin: false, dataKey: "",
   members: [], config: null, tasks: [], kpis: [], ledger: [],
   ready: {}, need: [],
-  tab: "home", adminSub: "settings", forms: [], kpiMonth: THISMONTH, metMonth: THISMONTH, calMonth: THISMONTH, repMonth: THISMONTH, tplCat: "all", selDay: TODAY, moneyMonth: THISMONTH,
+  tab: "home", adminSub: "settings", forms: [], kpiMonth: THISMONTH, metMonth: THISMONTH < "2026-11" ? "2026-11" : THISMONTH, calMonth: THISMONTH, repMonth: THISMONTH, tplCat: "all", selDay: TODAY, moneyMonth: THISMONTH,
   onlyMine: ls.get("shin_onlymine", "0") === "1"
 };
 let memberUnsub = null, permsUnsub = null, dataUnsubs = [];
@@ -913,20 +913,25 @@ function stripePanel() {
 }
 
 /* ===================== 計測数値：月に1回、その月の数値を記入する（副管理者以上） ===================== */
+const MET_START = "2026-11";   // 計測数値は2026年11月から
 const metList = () => [...(S.metrics || [])].sort((a, b) => (a.order || 0) - (b.order || 0));
 const metVal = (m, mo) => { const v = (m.values || {})[mo]; return v === null || v === undefined || v === "" ? null : Number(v); };
 const dragHandle = label => `<button type="button" class="dhandle" aria-label="${esc(label)}を並べ替え（↑↓キーで移動）" title="ドラッグして並べ替え"><svg width="12" height="18" viewBox="0 0 12 18" aria-hidden="true" fill="currentColor"><circle cx="3" cy="3" r="1.6"/><circle cx="9" cy="3" r="1.6"/><circle cx="3" cy="9" r="1.6"/><circle cx="9" cy="9" r="1.6"/><circle cx="3" cy="15" r="1.6"/><circle cx="9" cy="15" r="1.6"/></svg></button>`;
 function vMetrics() {
+  if (S.metMonth < MET_START) S.metMonth = MET_START;
   const list = metList(); const ed = can("met_edit"); const end = S.metMonth;
-  const months = Array.from({ length: 6 }, (_, i) => shiftMonth(end, i - 5));
+  // PCは6か月分。11月より前は出さず、その分は先の月を並べる
+  const first = shiftMonth(end, -5) < MET_START ? MET_START : shiftMonth(end, -5);
+  const months = Array.from({ length: 6 }, (_, i) => shiftMonth(first, i));
   const head = `<div class="bar"><h2 class="vh">計測数値</h2>${monthNav("metMonth")}${ed ? `<button class="btn" type="button" data-act="met-new">項目を追加</button>` : ""}</div>
-    <p class="muted" style="font-size:.85rem;margin:-8px 0 14px">月に1回、その月の数値を記入します。見られるのは副管理者以上だけです。${ed ? "左のつまみをドラッグすると、項目の順番を変えられます。" : ""}</p>`;
+    <p class="muted" style="font-size:.85rem;margin:-8px 0 10px">月に1回、その月の数値を記入します（2026年11月から）。見られるのは副管理者以上だけです。${ed ? "左のつまみをドラッグすると、項目の順番を変えられます。" : ""}</p>
+    <p class="met-caution">※ ここでいう「有料ユーザー」には、広告なしユーザーを含みません。</p>`;
   if (!list.length) return head + `<div class="empty"><p>まだ項目がありません。</p>${ed ? `<button class="btn small" type="button" data-act="met-new">最初の項目を追加</button>` : ""}</div>`;
   const cell = (m, mo) => { const v = metVal(m, mo);
     return ed ? `<input class="cell" type="number" inputmode="decimal" step="any" data-act="met-cell" data-id="${esc(m.id)}" data-m="${mo}" value="${v === null ? "" : esc(v)}" aria-label="${esc(m.name)} ${monthLabel(mo)}">` : (v === null ? `<span class="muted">—</span>` : num(v)); };
   const delta = (m, mo) => { const a = metVal(m, mo), b = metVal(m, shiftMonth(mo, -1)); if (a === null || b === null) return ""; const d = a - b; return `<span class="delta ${d > 0 ? "up" : d < 0 ? "down" : ""}">${d > 0 ? "+" : d < 0 ? "−" : "±"}${num(Math.abs(d))}${esc(m.unit || "")}</span>`; };
   const nameCell = m => `<div class="met-name">${ed ? dragHandle(m.name) : ""}<div><b>${esc(m.name)}</b>${m.unit ? `<span class="muted">（${esc(m.unit)}）</span>` : ""}${m.note ? `<div class="muted met-note">${esc(m.note)}</div>` : ""}</div>${ed ? `<button class="link" type="button" data-act="met-edit" data-id="${esc(m.id)}">編集</button>` : ""}</div>`;
-  return head + `<section class="panel met-pc"><div class="tablewrap"><table class="met-table"><thead><tr><th>項目</th>${months.map(mo => `<th class="num${mo === THISMONTH ? " now" : ""}">${mo.slice(0, 4) !== end.slice(0, 4) || mo.endsWith("-01") ? mo.slice(0, 4) + "年" : ""}${Number(mo.slice(5))}月</th>`).join("")}</tr></thead>
+  return head + `<section class="panel met-pc"><div class="tablewrap"><table class="met-table"><thead><tr><th>項目</th>${months.map((mo, i) => `<th class="num${mo === THISMONTH ? " now" : ""}">${i === 0 || mo.endsWith("-01") ? mo.slice(0, 4) + "年" : ""}${Number(mo.slice(5))}月</th>`).join("")}</tr></thead>
       <tbody data-dkind="metrics">${list.map(m => `<tr data-drow="${esc(m.id)}"><td>${nameCell(m)}</td>${months.map(mo => `<td class="num${mo === THISMONTH ? " now" : ""}">${cell(m, mo)}</td>`).join("")}</tr>`).join("")}</tbody></table></div></section>
     <section class="panel met-sp"><h3>${monthLabel(end)}</h3><div data-dkind="metrics">${list.map(m => `<div class="met-row" data-drow="${esc(m.id)}">${nameCell(m)}<div class="met-in">${cell(m, end)}${delta(m, end)}</div></div>`).join("")}</div></section>`;
 }
@@ -1947,9 +1952,11 @@ document.addEventListener("click", async e => {
   if (act === "notify") return notifyDialog();
   if (act === "mpick") { const k = a.dataset.k; return openSheet({ kind: "month", key: k, y: Number(S[k].slice(0, 4)) }); }
   if (act === "mp-year") { S.sheet.y += Number(a.dataset.step); refreshSheet(); return; }
+  if (act === "mp-pick" && S.sheet && S.sheet.key === "metMonth" && a.dataset.v < MET_START) { toast("計測数値は2026年11月からです", "info"); return; }
   if (act === "mp-pick") { const k = S.sheet.key; const v = a.dataset.v; closeDlg(); if (v !== S[k]) { S.anim = v < S[k] ? "r" : "l"; S[k] = v; if (k === "calMonth") S.selDay = v === THISMONTH ? TODAY : v + "-01"; render(); } return; }
   if (act === "kpi-detail") return openSheet({ kind: "kpi", id });
   if (act === "go") { if (dlg.open) closeDlg(); S.anim = "in"; S.tab = a.dataset.tab; render(); window.scrollTo(0, 0); return; }
+  if (act === "mprev" && a.dataset.k === "metMonth" && shiftMonth(S.metMonth, -1) < MET_START) { toast("計測数値は2026年11月からです", "info"); return; }
   if (act === "mprev" || act === "mnext") { const k = a.dataset.k; S.anim = act === "mprev" ? "r" : "l"; S[k] = shiftMonth(S[k], act === "mprev" ? -1 : 1); if (k === "calMonth") S.selDay = S.calMonth === THISMONTH ? TODAY : S.calMonth + "-01"; render(); return; }
   if (act === "kpi-new") return kpiDialog(null);
   if (act === "met-new") { if (can("met_edit")) metricDialog(null); return; }
