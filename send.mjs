@@ -4,7 +4,8 @@
 //     その人が担当の業務を、その人の現地時間に直して1回だけ送る
 //  2. 未対応事項の通知：追加した人以外に送る。各メンバーの夜間の時間帯には送らず、明けてから届ける
 //  3. 議事録のまとめ：「まとめ待ち」の議事録があれば、Gemini で要約して書き戻し、追加した人に通知する
-//  4. Stripe 連携：取引を収支に（暗号化して）記録し、契約数・MRRをKPIに入れる（STRIPE_KEY があるときだけ）
+//  4. 日程調整：始まったとき・締め切り前・決定したときに、参加者へ通知する
+//  5. Stripe 連携：取引を収支に（暗号化して）記録し、契約数・MRRをKPIに入れる（STRIPE_KEY があるときだけ）
 import { initializeApp, cert } from "firebase-admin/app";
 import { getFirestore, FieldValue, FieldPath } from "firebase-admin/firestore";
 import { getMessaging } from "firebase-admin/messaging";
@@ -29,7 +30,7 @@ export function localParts(tz, d = new Date()) {
 const jstAbs = (date, time) => new Date(`${date}T${time}:00+09:00`);
 export function prefsOf(member, cfg = {}) {
   const n = member.notify || {};
-  return { morning: n.morning !== false, time: n.time || cfg.notifyTime || "07:30", tz: n.tz || "Asia/Tokyo", issues: n.issues !== false, minutes: n.minutes !== false, quietStart: n.quietStart || "23:00", quietEnd: n.quietEnd || "07:00" };
+  return { morning: n.morning !== false, time: n.time || cfg.notifyTime || "07:30", tz: n.tz || "Asia/Tokyo", issues: n.issues !== false, minutes: n.minutes !== false, polls: n.polls !== false, quietStart: n.quietStart || "23:00", quietEnd: n.quietEnd || "07:00" };
 }
 export function inQuiet(pref, now = new Date()) {
   const t = localParts(pref.tz, now).time, a = pref.quietStart, b = pref.quietEnd;
@@ -129,6 +130,56 @@ export async function issueNotify(db, fcm, cfg, members) {
     if (n) await b.commit();
   }
   console.log(`未対応事項：${items.length}件を確認`);
+}
+
+/* ===== 日程調整の通知：始まったとき（回答のお願い）・締め切りの前日と当日（未回答の人に催促）・決定したとき ===== */
+const shortMd = d => `${Number(d.slice(5, 7))}/${Number(d.slice(8, 10))}`;
+function localSlot(c, tz) {
+  if (!tz || tz === "Asia/Tokyo") return `${shortMd(c.date)} ${c.start}–${c.end}`;
+  const a = localParts(tz, new Date(`${c.date}T${c.start}:00+09:00`)), b = localParts(tz, new Date(`${c.date}T${c.end}:00+09:00`));
+  return `${shortMd(a.date)} ${a.time}–${b.time}（現地時間）`;
+}
+export function pollUnanswered(p, uid) { const a = (p.answers || {})[uid] || {}; return (p.candidates || []).some(c => !a[c.id]); }
+/* 1人ずつ、夜間を避けて送り、送った人を記録する。全員に届いたら（または24時間たったら）完了にする */
+async function sendQueued(db, fcm, cfg, members, docs, { sentField, doneField, targets, build, tag }) {
+  const now = Date.now();
+  for (const d of docs) {
+    const p = d.data(); const sent = new Set(p[sentField] || []);
+    const list = targets(p).map(id => members.find(m => m.id === id)).filter(Boolean).filter(m => prefsOf(m, cfg).polls);
+    for (const m of list) {
+      if (sent.has(m.id) || (!FORCE && inQuiet(prefsOf(m, cfg)))) continue;
+      const msg = build(p, m, prefsOf(m, cfg)); sent.add(m.id);
+      if (!DRY) await d.ref.update({ [sentField]: FieldValue.arrayUnion(m.id) });
+      await sendTo(db, fcm, m.id, m.name, msg.title, msg.body, tag + d.id);
+    }
+    const created = p.createdAt && p.createdAt.toMillis ? p.createdAt.toMillis() : now;
+    if (!DRY && (list.every(m => sent.has(m.id)) || now - created > 24 * 3600e3)) await d.ref.update({ [doneField]: true });
+  }
+}
+export async function pollNotify(db, fcm, cfg, members, stateRef, remindState) {
+  const newSnap = await db.collection("polls").where("notified", "==", false).get();
+  await sendQueued(db, fcm, cfg, members, newSnap.docs.filter(d => d.data().status === "open"), {
+    sentField: "sentTo", doneField: "notified", tag: "poll-",
+    targets: p => (p.participants || []).filter(u => u !== p.createdBy),
+    build: p => ({ title: "日程調整の回答をお願いします", body: `${p.title}（候補${(p.candidates || []).length}件）${p.deadline ? `\n締め切り ${shortMd(p.deadline)}` : ""}` })
+  });
+  const decSnap = await db.collection("polls").where("decidedNotified", "==", false).get();
+  await sendQueued(db, fcm, cfg, members, decSnap.docs, {
+    sentField: "decidedSentTo", doneField: "decidedNotified", tag: "poll-dec-",
+    targets: p => p.participants || [],
+    build: (p, m, pref) => { const c = (p.candidates || []).find(x => x.id === p.decided) || {}; return { title: "日程が決まりました", body: `${p.title}\n${c.date ? localSlot(c, pref.tz) : ""}` }; }
+  });
+  // 催促：締め切りが今日か明日（日本時間）で、まだ答えていない人に、その人の朝の時刻を過ぎたら1日1回
+  const openSnap = await db.collection("polls").where("status", "==", "open").get();
+  const jst = localParts("Asia/Tokyo").date, tomorrow = addDaysStr(jst, 1);
+  const due = openSnap.docs.map(d => ({ id: d.id, ...d.data() })).filter(p => p.deadline && (p.deadline === jst || p.deadline === tomorrow));
+  for (const m of members) {
+    const pref = prefsOf(m, cfg); if (!pref.polls) continue;
+    const lp = localParts(pref.tz); if (remindState[m.id] === lp.date || lp.time < pref.time || lp.time >= "21:00" || (!FORCE && inQuiet(pref))) continue;
+    const list = due.filter(p => (p.participants || []).includes(m.id) && pollUnanswered(p, m.id)); if (!list.length) continue;
+    if (!DRY) await stateRef.set({ pollRemind: { [m.id]: lp.date } }, { merge: true });
+    await sendTo(db, fcm, m.id, m.name, "日程調整の締め切りが近づいています", list.map(p => `・${p.title}（締め切り ${shortMd(p.deadline)}）`).join("\n"), "poll-remind");
+  }
 }
 
 /* ===================== Stripe 連携 =====================
@@ -398,6 +449,7 @@ async function main() {
     await sendTo(db, fcm, m.id, m.name, msg.title, msg.body, "morning");
   }
   await issueNotify(db, fcm, cfg, members);
+  await pollNotify(db, fcm, cfg, members, stateRef, (stateSnap.exists && stateSnap.data().pollRemind) || {}).catch(e => console.log("日程調整の通知：" + e.message));
   await stripeSync(db).catch(e => console.log("Stripe：" + e.message));
   await summarizeMinutes(db, fcm);
 }

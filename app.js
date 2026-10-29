@@ -1,5 +1,5 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
-import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
+import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, onAuthStateChanged, signOut, reauthenticateWithPopup } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
 import { getFirestore, collection, doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc, onSnapshot, query, where, writeBatch, FieldPath, serverTimestamp, arrayUnion } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
 import { getMessaging, getToken, deleteToken, onMessage, isSupported } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-messaging.js";
 import { firebaseConfig, ADMIN_EMAILS } from "./config.js";
@@ -85,12 +85,13 @@ const DEFAULT_KPIS = [];
 const KPI_TEMPLATES = DEFAULT_KPIS;
 const KPI_AUTO = [["", "しない（担当者が入力）"], ["stripe_mrr", "Stripe：MRR（月ごとの継続課金の売上）"], ["stripe_active", "Stripe：有料会員数"], ["stripe_new", "Stripe：新しく有料会員になった数"], ["stripe_canceled", "Stripe：解約した数"]];
 
-const TABS_ALL = [["home", "ホーム"], ["cal", "業務カレンダー"], ["kpi", "KPI"], ["metrics", "計測数値"], ["forms", "フォーム"], ["templates", "テンプレ一覧"], ["minutes", "議事録"], ["money", "収支"], ["admin", "管理（設定・メンバー）"]];
+const TABS_ALL = [["home", "ホーム"], ["cal", "業務カレンダー"], ["polls", "日程調整"], ["kpi", "KPI"], ["metrics", "計測数値"], ["forms", "フォーム"], ["templates", "テンプレ一覧"], ["minutes", "議事録"], ["money", "収支"], ["admin", "管理（設定・メンバー）"]];
 const TAB_ICON = {
   home: '<path d="M3 11 12 4l9 7"/><path d="M5 10v10h14V10"/>',
   kpi: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
   metrics: '<path d="M3 3v18h18"/><path d="M7 15l4-5 3 3 5-6"/>',
   cal: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+  polls: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4M8 14l2 2 4-4"/>',
   templates: '<path d="M4 5h16v11H8l-4 4z"/><path d="M8 9h8M8 12h5"/>',
   forms: '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/>',
   money: '<rect x="2" y="6" width="20" height="13" rx="2"/><circle cx="12" cy="12.5" r="2.5"/><path d="M6 9.5v.01M18 15.5v.01"/>',
@@ -120,6 +121,7 @@ const PERM_DEFS = [
   ["フォーム", [["forms_view", "見る"], ["forms_manage", "追加・編集"]]],
   ["テンプレ一覧", [["tpl_view", "見る"], ["tpl_add", "追加する（自分の分の編集）"], ["tpl_editAll", "全員の分を編集・削除"]]],
   ["議事録", [["min_view", "見る"], ["min_add", "追加する（自分の分の編集）"], ["min_editAll", "全員の分を編集・削除"]]],
+  ["日程調整", [["poll_create", "日程調整を始める・決定する（参加者は誰でも回答できる）"]]],
   ["計測数値", [["met_view", "見る"], ["met_edit", "項目の追加・数値の記入"]]],
   ["収支", [["fin_add", "記録を追加（自分が追加した記録だけ見られる）"], ["fin_view", "すべての記録と集計を見る（shincareer.com のアカウントのみ）"], ["fin_edit", "すべての記録を編集・削除（shincareer.com のアカウントのみ）"]]]
 ];
@@ -233,6 +235,9 @@ function startData() {
   if (can("cal_view")) listen("tasks", collection(db, "tasks"), s => S.tasks = docsOf(s));
   if (can("forms_view")) listen("forms", collection(db, "forms"), s => S.forms = docsOf(s));
   listen("issues", collection(db, "issues"), s => S.issues = docsOf(s));
+  // 日程調整：作る人はすべて、ほかの人は自分が参加者のものだけ
+  if (can("poll_create")) listen("polls", collection(db, "polls"), s => S.polls = docsOf(s));
+  else listen("polls", query(collection(db, "polls"), where("participants", "array-contains", uid())), s => S.polls = docsOf(s));
   if (can("min_view")) listen("minutes", collection(db, "minutes"), s => S.minutes = docsOf(s));
   if (can("tpl_view")) listen("templates", collection(db, "templates"), s => S.templates = docsOf(s));
   if (S.isAdmin) listen("invites", collection(db, "invites"), s => S.invites = docsOf(s));
@@ -444,7 +449,7 @@ function render() {
     return;
   }
   if (!S.need.length || !S.need.every(k => S.ready[k])) { if (!main.querySelector(".sk-wrap")) main.innerHTML = skeleton(S.tab); return; }
-  const views = { home: vHome, kpi: vKpi, metrics: vMetrics, cal: vCal, forms: vForms, money: vMoney, minutes: vMinutes, templates: vTemplates, admin: vAdmin };
+  const views = { polls: () => { if (S.pollId) { const p = (S.polls || []).find(x => x.id === S.pollId); if (p) return vPollDetail(p); S.pollId = null; } return vPolls(); }, home: vHome, kpi: vKpi, metrics: vMetrics, cal: vCal, forms: vForms, money: vMoney, minutes: vMinutes, templates: vTemplates, admin: vAdmin };
   if (S.tab === "admin" && S.adminSub === "settings" && (S.settingsDirty || S.dragging) && main.querySelector("[data-list]")) return;
   if (S.dragging) return;   // 並べ替えの途中は描き直さない
   // パスワードを入力している途中は、データが更新されても画面を描き直さない
@@ -509,9 +514,12 @@ function vHome() {
   const untilMtg = daysBetween(TODAY, NEXTMTG);
   const mtgKpis = S.kpis.filter(k => k.month === NEXTMTG.slice(0, 7));
   const myKpiNoReport = untilMtg <= 3 && can("kpi_input") ? mtgKpis.filter(k => k.owner === uid() && !((k.weekly || {})[NEXTMTG] && (k.weekly || {})[NEXTMTG].value !== null)) : [];
+  const pollAsk = (S.polls || []).filter(p => p.status === "open" && pollMine(p) && !answeredAll(p));
+  const pollBanner = pollAsk.length ? `<section class="panel ask-panel"><h3>日程調整の回答をお願いします<span class="hint">${pollAsk.length}件</span></h3>${pollAsk.map(p => `<div class="ask"><b>${esc(p.title)}</b>${p.deadline ? `<span class="muted" style="font-size:.8rem">（締め切り ${md(p.deadline)}）</span>` : ""} <button class="link" type="button" data-act="go-poll" data-id="${esc(p.id)}">回答する</button></div>`).join("")}</section>` : "";
   return `<div class="bar"><h2>${md(TODAY)}</h2><span class="muted">${esc(memName(uid()))}さん</span></div>
   <div class="grid2 home-grid">
     <div class="stack">
+      ${pollBanner}
       <section class="panel"><h3>今日やること<span class="hint">${myOpen ? `残り${myOpen}件` : ""}</span></h3>
         ${myOpen ? mine.filter(t => !t.done).map(t => taskItem(t)).join("") : `<p class="muted" style="margin:0">${mine.length ? "今日の業務はすべて完了しました。" : "今日の業務はありません。"}</p>`}
         ${myKpiNoReport.length ? `<div class="banner" style="margin:12px 0 0">${untilMtg === 0 ? "今日" : untilMtg === 1 ? "明日" : untilMtg + "日後"}の${mtgLabel(NEXTMTG)}締め（${md(NEXTMTG)}）までにKPIの報告をお願いします：${myKpiNoReport.map(k => esc(k.name)).join("、")} <button class="link" type="button" data-act="go" data-tab="kpi">入力する</button></div>` : ""}
@@ -983,6 +991,165 @@ document.addEventListener("keydown", e => {
   e.key === "ArrowUp" ? box.insertBefore(row, sib) : box.insertBefore(sib, row); h.focus(); saveOrder(box);
 });
 
+/* ===================== 日程調整 =====================
+   ・副管理者以上（poll_create）が、候補の日時を出して調整を始める。Googleカレンダーの空き状況から候補を自動で出せる
+   ・参加者は ○△× で答える（自分の欄だけ書き換えられる）。答えはあとから見直し・変更できる
+   ・決定すると、業務カレンダーに登録される。日時はすべて日本時間で扱う */
+const ANS = [["yes", "○", "参加できる"], ["maybe", "△", "調整すれば参加できる"], ["no", "×", "参加できない"]];
+const ansMark = v => (ANS.find(a => a[0] === v) || [null, "—"])[1];
+const pollMine = p => (p.participants || []).includes(uid());
+const myAns = (p, cid) => ((p.answers || {})[uid()] || {})[cid];
+const answeredAll = p => (p.candidates || []).every(c => myAns(p, c.id));
+const candScore = (p, c) => { let y = 0, m = 0, n = 0, none = 0; (p.participants || []).forEach(u => { const v = ((p.answers || {})[u] || {})[c.id]; v === "yes" ? y++ : v === "maybe" ? m++ : v === "no" ? n++ : none++; }); return { y, m, n, none, score: y * 2 + m }; };
+const candLabel = c => `${md(c.date)} ${c.start}–${c.end}`;
+const addMin = (hm, min) => { const [h, m] = hm.split(":").map(Number); const t = h * 60 + m + min; return pad(Math.floor(t / 60)) + ":" + pad(t % 60); };
+/* 自分のタイムゾーンが日本以外なら、現地時間も添える */
+function localHint(c) {
+  const tz = myNotify().tz; if (!tz || tz === "Asia/Tokyo") return "";
+  try { const d = new Date(`${c.date}T${c.start}:00+09:00`); return `（現地 ${new Intl.DateTimeFormat("ja-JP", { timeZone: tz, month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(d)}）`; } catch (e) { return ""; }
+}
+function vPolls() {
+  const all = [...(S.polls || [])].sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
+  const mine = can("poll_create") ? all : all.filter(pollMine);
+  const open = mine.filter(p => p.status === "open"), done = mine.filter(p => p.status !== "open");
+  const head = `<div class="bar"><h2 class="vh">日程調整</h2>${can("poll_create") ? `<button class="btn" type="button" data-act="poll-new">日程調整を始める</button>` : ""}</div>
+    <p class="muted" style="font-size:.85rem;margin:-8px 0 14px">候補の日時に ○・△・× で答えてください。答えはあとから見直し・変更できます。日時はすべて日本時間です。</p>`;
+  if (!mine.length) return head + `<div class="empty"><p>${can("poll_create") ? "まだ日程調整はありません。" : "あなたが参加する日程調整はまだありません。"}</p>${can("poll_create") ? `<button class="btn small" type="button" data-act="poll-new">最初の日程調整を始める</button>` : ""}</div>`;
+  const card = p => {
+    const need = p.status === "open" && pollMine(p) && !answeredAll(p);
+    const best = (p.candidates || []).map(c => ({ c, s: candScore(p, c) })).sort((a, b) => b.s.score - a.s.score)[0];
+    const dec = p.status === "decided" ? (p.candidates || []).find(c => c.id === p.decided) : null;
+    const answered = (p.participants || []).filter(u => Object.keys((p.answers || {})[u] || {}).length).length;
+    return `<article class="panel poll-card${need ? " need" : ""}" data-act="poll-open" data-id="${esc(p.id)}" role="button" tabindex="0">
+      <div class="poll-h"><b>${esc(p.title)}</b>${p.status === "decided" ? `<span class="pill good">決定</span>` : p.status === "closed" ? `<span class="pill plain">終了</span>` : need ? `<span class="pill warn">回答してください</span>` : `<span class="pill info">回答受付中</span>`}</div>
+      <div class="muted poll-meta">${dec ? `決定：${esc(candLabel(dec))}` : `候補${(p.candidates || []).length}件・回答 ${answered}/${(p.participants || []).length}人${p.deadline ? `・締め切り ${md(p.deadline)}` : ""}`}${!dec && best && can("poll_create") && best.s.score ? `・いちばん集まっている候補：${esc(candLabel(best.c))}（○${best.s.y}）` : ""}</div>
+      <div class="muted poll-meta">作成：${esc(memName(p.createdBy))}</div></article>`;
+  };
+  return head + (open.length ? `<div class="sub-head" style="border:0;margin-top:0">回答受付中</div><div class="poll-list">${open.map(card).join("")}</div>` : "") +
+    (done.length ? `<div class="sub-head">決定・終了</div><div class="poll-list">${done.slice(0, 30).map(card).join("")}</div>` : "");
+}
+function vPollDetail(p) {
+  const cands = p.candidates || []; const parts = (p.participants || []).map(u => ({ id: u, name: memName(u) }));
+  const iAm = pollMine(p) && p.status === "open"; const mgr = can("poll_create");
+  const scored = cands.map(c => ({ c, s: candScore(p, c) }));
+  const top = Math.max(0, ...scored.map(x => x.s.score));
+  const back = `<button class="link min-back" type="button" data-act="poll-back">‹ 日程調整の一覧</button>`;
+  const tools = mgr ? `<button class="btn sec small" type="button" data-act="poll-edit" data-id="${esc(p.id)}">編集</button>` : "";
+  const mineBox = iAm ? `<section class="panel"><h3>あなたの回答${answeredAll(p) ? `<span class="pill good">回答済み</span>` : `<span class="pill warn">未回答があります</span>`}</h3>
+      <div class="poll-ans">${cands.map(c => `<div class="pa-row"><div><b>${esc(candLabel(c))}</b><span class="muted">${esc(localHint(c))}</span></div><div class="pa-btns" role="group" aria-label="${esc(candLabel(c))}">${ANS.map(([v, mk, l]) => `<button type="button" class="pa${myAns(p, c.id) === v ? " on" : ""}" data-act="poll-ans" data-id="${esc(p.id)}" data-c="${esc(c.id)}" data-v="${v}" aria-pressed="${myAns(p, c.id) === v}" title="${l}">${mk}</button>`).join("")}</div></div>`).join("")}</div>
+      <p class="muted" style="font-size:.78rem;margin:8px 0 0">押すとすぐ保存されます。○＝参加できる／△＝調整すれば参加できる／×＝参加できない</p></section>` : "";
+  const table = `<section class="panel"><h3>みんなの回答<span class="hint">${parts.length}人</span></h3><div class="tablewrap"><table class="poll-table"><thead><tr><th>候補（日本時間）</th><th class="num">○</th><th class="num">△</th><th class="num">×</th>${parts.map(x => `<th class="pt-cell">${esc(x.name)}</th>`).join("")}${mgr && p.status === "open" ? "<th></th>" : ""}</tr></thead><tbody>
+    ${scored.map(({ c, s }) => `<tr class="${p.decided === c.id ? "decided" : top && s.score === top && p.status === "open" ? "best" : ""}"><td>${esc(candLabel(c))}${p.decided === c.id ? ` <span class="pill good">決定</span>` : ""}</td><td class="num">${s.y}</td><td class="num">${s.m}</td><td class="num">${s.n}</td>${parts.map(x => `<td class="pt-cell">${ansMark(((p.answers || {})[x.id] || {})[c.id])}</td>`).join("")}${mgr && p.status === "open" ? `<td><button class="btn small" type="button" data-act="poll-decide" data-id="${esc(p.id)}" data-c="${esc(c.id)}">${S.armDel === "dec:" + c.id ? "この日時で決定する" : "決定"}</button></td>` : ""}</tr>`).join("")}
+    </tbody></table></div>${mgr && p.status === "open" ? `<p class="muted" style="font-size:.78rem;margin:8px 0 0">「決定」を押すと、業務カレンダーに登録して、参加者に通知します（2回押して確定）。</p>` : ""}</section>`;
+  return `<div class="bar">${back}<span class="sp"></span>${tools}</div>
+    <div class="min-head"><span class="muted">${p.deadline ? `締め切り ${md(p.deadline)}・` : ""}${p.duration}分・作成：${esc(memName(p.createdBy))}</span><h2>${esc(p.title)}</h2>${p.note ? `<p class="muted" style="margin:4px 0 0;white-space:pre-line">${esc(p.note)}</p>` : ""}</div>
+    <div class="stack">${mineBox}${table}</div>`;
+}
+/* ===== Googleカレンダーの空き状況（予定があるかどうかだけ。予定の名前や中身は読まない） ===== */
+const CAL_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy";
+let calToken = null, calTokenAt = 0;
+async function calAccessToken() {
+  if (calToken && Date.now() - calTokenAt < 50 * 60e3) return calToken;
+  const p = new GoogleAuthProvider(); p.addScope(CAL_SCOPE); p.setCustomParameters({ login_hint: (S.user && S.user.email) || "" });
+  const r = await reauthenticateWithPopup(auth.currentUser, p);
+  const cred = GoogleAuthProvider.credentialFromResult(r); if (!cred || !cred.accessToken) throw new Error("カレンダーの読み取りを許可できませんでした。");
+  calToken = cred.accessToken; calTokenAt = Date.now(); return calToken;
+}
+const calEmailOf = id => { const m = S.members.find(x => x.id === id); return m ? (m.calEmail || m.email || "") : ""; };
+async function freeBusy(ids, from, to) {
+  const tok = await calAccessToken();
+  const items = ids.map(id => ({ id: calEmailOf(id) })).filter(x => x.id);
+  const res = await fetch("https://www.googleapis.com/calendar/v3/freeBusy", { method: "POST", headers: { Authorization: "Bearer " + tok, "Content-Type": "application/json" },
+    body: JSON.stringify({ timeMin: `${from}T00:00:00+09:00`, timeMax: `${addDays(to, 1)}T00:00:00+09:00`, timeZone: "Asia/Tokyo", items }) });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) { if (res.status === 401) calToken = null; throw new Error(res.status === 403 ? "Googleカレンダーの機能がオンになっていないか、読み取りが許可されていません（README の手順を確認してください）。" : `カレンダーを読めませんでした（${res.status}）。`); }
+  const busy = {}, unknown = [];
+  ids.forEach(id => { const c = (j.calendars || {})[calEmailOf(id)]; if (!c || (c.errors && c.errors.length)) unknown.push(id); else busy[id] = (c.busy || []).map(b => [Date.parse(b.start), Date.parse(b.end)]); });
+  return { busy, unknown };
+}
+const addDays = (d, n) => { const x = parse(d); x.setDate(x.getDate() + n); return ymd(x); };
+/* 全員が空いている時間を、早い順に、1日2件までで5件えらぶ */
+function suggestSlots({ busy, from, to, dayStart, dayEnd, duration, weekends, count = 5, exclude = [] }) {
+  const out = []; const perDay = {};
+  for (let d = from; d <= to; d = addDays(d, 1)) {
+    const dow = parse(d).getDay(); if (!weekends && (dow === 0 || dow === 6)) continue; if (d < TODAY) continue;
+    for (let t = dayStart; addMin(t, duration) <= dayEnd; t = addMin(t, 30)) {
+      const s = Date.parse(`${d}T${t}:00+09:00`), e = s + duration * 60e3; if (s < Date.now() + 60 * 60e3) continue;
+      if (Object.values(busy).some(list => list.some(([bs, be]) => bs < e && be > s))) continue;
+      if ((perDay[d] || 0) >= 2 || exclude.includes(d + " " + t)) continue;
+      out.push({ id: "c" + Math.random().toString(36).slice(2, 8), date: d, start: t, end: addMin(t, duration) }); perDay[d] = (perDay[d] || 0) + 1;
+      t = addMin(t, Math.max(30, duration) - 30);   // 同じ日の2件目は少し離す
+      if (out.length >= count) return out;
+    }
+  }
+  return out;
+}
+function pollDialog(p) {
+  const v = p || { title: "", participants: activeMembers().map(m => m.id), duration: 60, from: TODAY, to: addDays(TODAY, 7), dayStart: "10:00", dayEnd: "20:00", deadline: addDays(TODAY, 3), note: "", candidates: [], weekends: false };
+  let cands = (v.candidates || []).map(c => ({ ...c }));
+  const timeSel = (name, cur) => `<select name="${name}" id="f-${name}">${timeOpts(6, 23, 30, cur)}</select>`;
+  const body = fld("タイトル", `<input name="title" id="f-title" required maxlength="40" value="${esc(v.title)}" placeholder="例：11月の定例MTG">`, { full: true, req: true }) +
+    `<div class="field full"><span class="lbl">参加者<span class="req">必須</span></span>${memberChips("participants", v.participants || [])}</div>` +
+    fld("長さ", sel("duration", [[30, "30分"], [60, "1時間"], [90, "1時間30分"], [120, "2時間"]], v.duration)) +
+    fld("回答の締め切り", `<input type="date" name="deadline" id="f-deadline" value="${esc(v.deadline || "")}">`) +
+    `<div class="field full poll-range"><span class="lbl">候補を探す範囲（日本時間）</span><div class="pr-row"><input type="date" name="from" id="f-from" value="${esc(v.from || TODAY)}" aria-label="いつから"><span>〜</span><input type="date" name="to" id="f-to" value="${esc(v.to || addDays(TODAY, 7))}" aria-label="いつまで"></div>
+      <div class="pr-row">${timeSel("dayStart", v.dayStart || "10:00")}<span>〜</span>${timeSel("dayEnd", v.dayEnd || "20:00")}</div>
+      <label class="checks"><input type="checkbox" name="weekends" id="f-weekends" value="1" ${v.weekends ? "checked" : ""}>土日も候補に入れる</label></div>` +
+    `<div class="field full"><span class="lbl">候補の日時<span class="req">必須</span></span><div id="cand-box"></div>
+      <div class="cand-tools"><button class="btn sec small" type="button" id="cand-cal">Googleカレンダーから候補を出す</button><span class="muted" id="cand-msg" style="font-size:.78rem"></span></div>
+      <div class="cand-add"><input type="date" id="ca-date" value="${esc(v.from || TODAY)}" aria-label="候補の日付"><select id="ca-start" aria-label="候補の開始">${timeOpts(6, 23, 30, "10:00")}</select><button class="btn sec small" type="button" id="cand-add">＋ 手で追加</button></div></div>` +
+    fld("メモ（任意）", `<textarea name="note" id="f-note" placeholder="例：オンライン（Meet）。議題は来月の施策">${esc(v.note || "")}</textarea>`, { full: true });
+  openDlg(p ? "日程調整を編集" : "日程調整を始める", body, {
+    submit: async f => {
+      const parts = f.__fd.getAll("participants");
+      if (!f.title.trim()) return showErr("タイトルを入力してください。"), false;
+      if (!parts.length) return showErr("参加者を1人以上選んでください。"), false;
+      if (!cands.length) return showErr("候補の日時を1つ以上入れてください。"), false;
+      const data = { title: f.title.trim(), participants: parts, duration: Number(f.duration), deadline: f.deadline || "", from: f.from, to: f.to, dayStart: f.dayStart, dayEnd: f.dayEnd, weekends: !!f.weekends, note: f.note.trim(), candidates: cands.sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start)) };
+      if (p) await updateDoc(doc(db, "polls", p.id), data);
+      else { const ref = await addDoc(collection(db, "polls"), { ...data, status: "open", answers: {}, createdBy: uid(), createdAt: serverTimestamp(), notified: false }); S.pollId = ref.id; S.anim = "in"; return "日程調整を始めました。参加者に通知されます"; }
+      return "保存しました";
+    },
+    del: p ? () => deleteDoc(doc(db, "polls", p.id)).then(() => { S.pollId = null; }) : null,
+    delInBody: p ? { label: "この日程調整を削除", help: "回答も一緒に消えます。業務カレンダーに登録済みの予定は残ります" } : null
+  });
+  const box = form.querySelector("#cand-box"), msg = form.querySelector("#cand-msg");
+  const dur = () => Number(form.querySelector("#f-duration").value);
+  const draw = () => { box.innerHTML = cands.length ? cands.sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start)).map(c => `<div class="cand-row"><span>${esc(candLabel(c))}</span><button type="button" class="link" data-rmc="${esc(c.id)}" style="color:var(--bad)">外す</button></div>`).join("") : `<p class="muted" style="margin:0;font-size:.85rem">まだ候補がありません。</p>`; };
+  box.addEventListener("click", e => { const b = e.target.closest("[data-rmc]"); if (b) { cands = cands.filter(c => c.id !== b.dataset.rmc); draw(); } });
+  form.querySelector("#cand-add").addEventListener("click", () => {
+    const d = form.querySelector("#ca-date").value, s = form.querySelector("#ca-start").value; if (!d) return;
+    if (cands.some(c => c.date === d && c.start === s)) return;
+    cands.push({ id: "c" + Math.random().toString(36).slice(2, 8), date: d, start: s, end: addMin(s, dur()) }); draw();
+  });
+  form.querySelector("#cand-cal").addEventListener("click", async e => {
+    const btn = e.currentTarget; const parts = [...form.querySelectorAll('[name="participants"]:checked')].map(x => x.value);
+    const from = form.querySelector("#f-from").value, to = form.querySelector("#f-to").value;
+    if (!parts.length) return (msg.textContent = "先に参加者を選んでください");
+    if (!from || !to || to < from) return (msg.textContent = "探す範囲の日付を確認してください");
+    if (daysBetween(from, to) > 31) return (msg.textContent = "探す範囲は31日以内にしてください");
+    btn.disabled = true; msg.textContent = "空き状況を確認しています…";
+    try {
+      const { busy, unknown } = await freeBusy(parts, from, to);
+      const add = suggestSlots({ busy, from, to, dayStart: form.querySelector("#f-dayStart").value, dayEnd: form.querySelector("#f-dayEnd").value, duration: dur(), weekends: form.querySelector("#f-weekends").checked, exclude: cands.map(c => c.date + " " + c.start) });
+      cands.push(...add); draw();
+      msg.textContent = (add.length ? `候補を${add.length}件追加しました。` : "全員が空いている時間が見つかりませんでした。範囲を広げるか、手で追加してください。") + (unknown.length ? ` カレンダーを読めなかった人：${unknown.map(memName).join("・")}（空き状況を見ずに出しています）` : "");
+    } catch (err) { msg.textContent = err.code === "auth/popup-closed-by-user" ? "許可の画面が閉じられました" : (err.message || errMsg(err)); }
+    btn.disabled = false;
+  });
+  form.querySelector("#f-duration").addEventListener("change", () => { cands = cands.map(c => ({ ...c, end: addMin(c.start, dur()) })); draw(); });
+  draw();
+}
+async function decidePoll(p, cid) {
+  const c = (p.candidates || []).find(x => x.id === cid); if (!c) return;
+  const routines = cfg().routines || []; const routine = routines.includes("MTG") ? "MTG" : "__other";
+  const tref = doc(collection(db, "tasks")); const b = writeBatch(db);
+  b.set(tref, { date: c.date, start: c.start, end: c.end, owner: p.participants[0] || uid(), owners: p.participants, routine, label: p.title, detail: routine === "__other" ? p.title : (p.note || ""), shareWith: ["all"], done: false, createdBy: uid(), createdAt: serverTimestamp(), fromPoll: p.id });
+  b.update(doc(db, "polls", p.id), { status: "decided", decided: cid, taskId: tref.id, decidedAt: serverTimestamp(), decidedNotified: false });
+  await b.commit();
+  toast(`${candLabel(c)} に決定し、業務カレンダーに登録しました`);
+}
+
 const canEditLed = r => finEdit() || (r.createdBy === uid() && finAdd());
 const ledStatus = r => r.confirmed ? `<span class="pill good">確認済</span>` : `<span class="pill plain">未確認</span>`;
 /* 収支を「追加だけ」できる人の画面：自分が追加した記録だけ */
@@ -1386,7 +1553,7 @@ const browserTz = () => { try { return Intl.DateTimeFormat().resolvedOptions().t
 const tzNow = tz => { try { return new Intl.DateTimeFormat("ja-JP", { timeZone: tz, month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date()); } catch (e) { return ""; } };
 function myNotify() {
   const c = cfg(); const n = (S.member && S.member.notify) || {};
-  return { morning: n.morning !== false, time: n.time || c.notifyTime || "07:30", tz: n.tz || "Asia/Tokyo", issues: n.issues !== false, minutes: n.minutes !== false, quietStart: n.quietStart || "23:00", quietEnd: n.quietEnd || "07:00", saved: !!S.member && !!S.member.notify };
+  return { morning: n.morning !== false, time: n.time || c.notifyTime || "07:30", tz: n.tz || "Asia/Tokyo", issues: n.issues !== false, minutes: n.minutes !== false, polls: n.polls !== false, quietStart: n.quietStart || "23:00", quietEnd: n.quietEnd || "07:00", saved: !!S.member && !!S.member.notify };
 }
 const timeOpts = (from, to, step, cur) => { const o = []; for (let m = from * 60; m <= to * 60; m += step) o.push(pad(Math.floor(m / 60) % 24) + ":" + pad(m % 60)); return o.map(x => `<option ${x === cur ? "selected" : ""}>${x}</option>`).join(""); };
 function notifyDialog() {
@@ -1402,11 +1569,13 @@ function notifyDialog() {
     <div class="field full nt-sec"><span class="lbl">受け取る通知</span>
       <label class="checks"><input type="checkbox" name="morning" id="n-morning" value="1" ${n.morning ? "checked" : ""}>朝の通知（自分が担当の業務がある日）${c.notifyEnabled === false ? `<span class="pill plain" style="margin-left:6px">管理者が停止中</span>` : ""}</label>
       <label class="checks"><input type="checkbox" name="issues" id="n-issues" value="1" ${n.issues ? "checked" : ""}>未対応事項が追加されたとき${c.issueNotify === false ? `<span class="pill plain" style="margin-left:6px">管理者が停止中</span>` : ""}</label>
-      <label class="checks"><input type="checkbox" name="minutes" id="n-minutes" value="1" ${n.minutes ? "checked" : ""}>自分が追加した議事録がまとまったとき</label></div>
+      <label class="checks"><input type="checkbox" name="minutes" id="n-minutes" value="1" ${n.minutes ? "checked" : ""}>自分が追加した議事録がまとまったとき</label>
+      <label class="checks"><input type="checkbox" name="polls" id="n-polls" value="1" ${n.polls ? "checked" : ""}>日程調整（回答のお願い・締め切り前日の催促・決定のお知らせ）</label></div>
     <div class="field full"><span class="lbl">タイムゾーン</span><select name="tz" id="n-tz">${tzList.map(([z, l]) => `<option value="${esc(z)}" ${z === n.tz ? "selected" : ""}>${esc(l)}（いま ${esc(tzNow(z))}）</option>`).join("")}</select>${tzHint}
       <span class="help">朝の通知の時刻と夜間の時間帯は、このタイムゾーンで判断します。業務の時刻も、この地域の時刻に直して届きます。</span></div>
     <div class="field"><span class="lbl">朝の通知の時刻</span><select name="time" id="n-time">${timeOpts(4, 12, 15, n.time)}</select></div>
     <div class="field"><span class="lbl">夜間は送らない</span><div class="nt-quiet"><select name="quietStart" id="n-qs" aria-label="夜間の開始">${timeOpts(19, 26, 30, n.quietStart)}</select><span>〜</span><select name="quietEnd" id="n-qe" aria-label="夜間の終わり">${timeOpts(4, 10, 30, n.quietEnd)}</select></div></div>
+    <div class="field full"><span class="lbl">日程調整で使うGoogleカレンダーのアドレス（任意）</span><input type="email" id="n-cal" value="${esc((S.member && S.member.calEmail) || "")}" placeholder="${esc((S.user && S.user.email) || "")}"><span class="help">空欄なら、ログインしているアドレスのカレンダーを使います。会社以外のカレンダーの場合は、そのカレンダーの設定で日程調整を作る人に「予定の表示（時間枠のみ）」を共有してください</span></div>
     <p class="muted full" style="grid-column:1/-1;margin:0;font-size:.78rem">夜間に追加された未対応事項は、夜間が明けてからまとめて届きます。実際に届くのは、設定した時刻から10分ほど遅れることがあります。</p>`;
   form.innerHTML = `<div class="dlg-h"><h3>通知</h3><button type="button" data-close aria-label="閉じる">×</button></div><div class="dlg-b">${body}<p class="err" id="f-err" hidden></p></div>
     <div class="dlg-f"><div class="sp"><button class="btn sec" type="button" data-close>閉じる</button><button class="btn" type="button" id="n-save">設定を保存</button></div></div>`;
@@ -1421,9 +1590,11 @@ function notifyDialog() {
 async function saveNotify(quiet) {
   const g = id => form.querySelector(id);
   const n = myNotify();
-  const data = g("#n-tz") ? { morning: g("#n-morning").checked, issues: g("#n-issues").checked, minutes: g("#n-minutes").checked, tz: g("#n-tz").value, time: g("#n-time").value, quietStart: g("#n-qs").value, quietEnd: g("#n-qe").value }
-    : { morning: n.morning, issues: n.issues, minutes: n.minutes, tz: quiet ? browserTz() : n.tz, time: n.time, quietStart: n.quietStart, quietEnd: n.quietEnd };
-  await updateDoc(doc(db, "members", uid()), { notify: data });
+  const data = g("#n-tz") ? { morning: g("#n-morning").checked, issues: g("#n-issues").checked, minutes: g("#n-minutes").checked, polls: g("#n-polls").checked, tz: g("#n-tz").value, time: g("#n-time").value, quietStart: g("#n-qs").value, quietEnd: g("#n-qe").value }
+    : { morning: n.morning, issues: n.issues, minutes: n.minutes, polls: n.polls, tz: quiet ? browserTz() : n.tz, time: n.time, quietStart: n.quietStart, quietEnd: n.quietEnd };
+  const ce = g("#n-cal") ? g("#n-cal").value.trim().toLowerCase() : null;
+  if (ce && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(ce)) throw new Error("カレンダーのアドレスの形が正しくありません。");
+  await updateDoc(doc(db, "members", uid()), { notify: data, ...(ce !== null ? { calEmail: ce } : {}) });
 }
 
 /* ================= dialogs ================= */
@@ -1955,10 +2126,25 @@ document.addEventListener("click", async e => {
   if (act === "mp-pick" && S.sheet && S.sheet.key === "metMonth" && a.dataset.v < MET_START) { toast("計測数値は2026年11月からです", "info"); return; }
   if (act === "mp-pick") { const k = S.sheet.key; const v = a.dataset.v; closeDlg(); if (v !== S[k]) { S.anim = v < S[k] ? "r" : "l"; S[k] = v; if (k === "calMonth") S.selDay = v === THISMONTH ? TODAY : v + "-01"; render(); } return; }
   if (act === "kpi-detail") return openSheet({ kind: "kpi", id });
+  if (act === "go-poll") { if (dlg.open) closeDlg(); S.tab = "polls"; S.pollId = id; S.anim = "in"; render(); window.scrollTo(0, 0); return; }
   if (act === "go") { if (dlg.open) closeDlg(); S.anim = "in"; S.tab = a.dataset.tab; render(); window.scrollTo(0, 0); return; }
   if (act === "mprev" && a.dataset.k === "metMonth" && shiftMonth(S.metMonth, -1) < MET_START) { toast("計測数値は2026年11月からです", "info"); return; }
   if (act === "mprev" || act === "mnext") { const k = a.dataset.k; S.anim = act === "mprev" ? "r" : "l"; S[k] = shiftMonth(S[k], act === "mprev" ? -1 : 1); if (k === "calMonth") S.selDay = S.calMonth === THISMONTH ? TODAY : S.calMonth + "-01"; render(); return; }
   if (act === "kpi-new") return kpiDialog(null);
+  if (act === "poll-new") { if (can("poll_create")) pollDialog(null); return; }
+  if (act === "poll-open") { S.pollId = id; S.anim = "l"; render(); window.scrollTo(0, 0); return; }
+  if (act === "poll-back") { S.pollId = null; S.anim = "r"; render(); return; }
+  if (act === "poll-edit") { const p = (S.polls || []).find(x => x.id === id); if (p && can("poll_create")) pollDialog(p); return; }
+  if (act === "poll-ans") {
+    const p = (S.polls || []).find(x => x.id === id); if (!p) return;
+    try { await updateDoc(doc(db, "polls", id), new FieldPath("answers", uid(), a.dataset.c), a.dataset.v); } catch (err) { toast(errMsg(err), "error"); }
+    return;
+  }
+  if (act === "poll-decide") {
+    const p = (S.polls || []).find(x => x.id === id); if (!p) return;
+    if (S.armDel !== "dec:" + a.dataset.c) { S.armDel = "dec:" + a.dataset.c; render(); clearTimeout(S.armTimer); S.armTimer = setTimeout(() => { S.armDel = null; render(); }, 5000); return; }
+    S.armDel = null; try { await decidePoll(p, a.dataset.c); } catch (err) { toast(errMsg(err), "error"); } return;
+  }
   if (act === "met-new") { if (can("met_edit")) metricDialog(null); return; }
   if (act === "met-edit") { const m = (S.metrics || []).find(x => x.id === id); if (m && can("met_edit")) metricDialog(m); return; }
   if (act === "kpi-tpl") return kpiDialog(null, KPI_TEMPLATES[+a.dataset.i]);
