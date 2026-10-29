@@ -1055,17 +1055,23 @@ async function calAccessToken() {
   const cred = GoogleAuthProvider.credentialFromResult(r); if (!cred || !cred.accessToken) throw new Error("カレンダーの読み取りを許可できませんでした。");
   calToken = cred.accessToken; calTokenAt = Date.now(); return calToken;
 }
-const calEmailOf = id => { const m = S.members.find(x => x.id === id); return m ? (m.calEmail || m.email || "") : ""; };
+/* 読むカレンダー：ログイン用のアドレス＋本人が追加したアドレス（複数可）。予定ありの時間は合わせて判断する */
+const calIdsOf = id => { const m = S.members.find(x => x.id === id); if (!m) return []; return [...new Set([m.email, ...String(m.calEmail || "").split(/[,、\s]+/)].map(x => (x || "").trim().toLowerCase()).filter(Boolean))]; };
 async function freeBusy(ids, from, to) {
   const tok = await calAccessToken();
-  const items = ids.map(id => ({ id: calEmailOf(id) })).filter(x => x.id);
+  const items = [...new Set(ids.flatMap(calIdsOf))].map(id => ({ id }));
   const res = await fetch("https://www.googleapis.com/calendar/v3/freeBusy", { method: "POST", headers: { Authorization: "Bearer " + tok, "Content-Type": "application/json" },
     body: JSON.stringify({ timeMin: `${from}T00:00:00+09:00`, timeMax: `${addDays(to, 1)}T00:00:00+09:00`, timeZone: "Asia/Tokyo", items }) });
   const j = await res.json().catch(() => ({}));
   if (!res.ok) { if (res.status === 401) calToken = null; throw new Error(res.status === 403 ? "Googleカレンダーの機能がオンになっていないか、読み取りが許可されていません（README の手順を確認してください）。" : `カレンダーを読めませんでした（${res.status}）。`); }
-  const busy = {}, unknown = [];
-  ids.forEach(id => { const c = (j.calendars || {})[calEmailOf(id)]; if (!c || (c.errors && c.errors.length)) unknown.push(id); else busy[id] = (c.busy || []).map(b => [Date.parse(b.start), Date.parse(b.end)]); });
-  return { busy, unknown };
+  const busy = {}, unknown = [], partial = [];
+  ids.forEach(id => {
+    const got = calIdsOf(id).map(cid => (j.calendars || {})[cid]).map(c => c && !(c.errors && c.errors.length) ? c : null);
+    if (!got.some(Boolean)) { unknown.push(id); return; }
+    if (got.some(c => !c)) partial.push(id);
+    busy[id] = got.filter(Boolean).flatMap(c => (c.busy || []).map(b => [Date.parse(b.start), Date.parse(b.end)]));
+  });
+  return { busy, unknown, partial };
 }
 const addDays = (d, n) => { const x = parse(d); x.setDate(x.getDate() + n); return ymd(x); };
 /* 全員が空いている時間を、早い順に、1日2件までで5件えらぶ */
@@ -1130,10 +1136,11 @@ function pollDialog(p) {
     if (daysBetween(from, to) > 31) return (msg.textContent = "探す範囲は31日以内にしてください");
     btn.disabled = true; msg.textContent = "空き状況を確認しています…";
     try {
-      const { busy, unknown } = await freeBusy(parts, from, to);
+      const { busy, unknown, partial } = await freeBusy(parts, from, to);
       const add = suggestSlots({ busy, from, to, dayStart: form.querySelector("#f-dayStart").value, dayEnd: form.querySelector("#f-dayEnd").value, duration: dur(), weekends: form.querySelector("#f-weekends").checked, exclude: cands.map(c => c.date + " " + c.start) });
       cands.push(...add); draw();
-      msg.textContent = (add.length ? `候補を${add.length}件追加しました。` : "全員が空いている時間が見つかりませんでした。範囲を広げるか、手で追加してください。") + (unknown.length ? ` カレンダーを読めなかった人：${unknown.map(memName).join("・")}（空き状況を見ずに出しています）` : "");
+      const counts = parts.filter(id => !unknown.includes(id)).map(id => `${memName(id)} ${(busy[id] || []).length}件`).join("・");
+      msg.textContent = (add.length ? `候補を${add.length}件追加しました。` : "全員が空いている時間が見つかりませんでした。範囲を広げるか、手で追加してください。") + (counts ? ` 読み取った予定：${counts}（終日の予定と「空き時間」にした予定は数えません）。` : "") + (unknown.length ? ` カレンダーを読めなかった人：${unknown.map(memName).join("・")}（空き状況を見ずに出しています）` : "") + (partial.length ? ` 一部のカレンダーを読めなかった人：${partial.map(memName).join("・")}（追加したカレンダーが共有されていない可能性があります）` : "");
     } catch (err) { msg.textContent = err.code === "auth/popup-closed-by-user" ? "許可の画面が閉じられました" : (err.message || errMsg(err)); }
     btn.disabled = false;
   });
@@ -1575,7 +1582,7 @@ function notifyDialog() {
       <span class="help">朝の通知の時刻と夜間の時間帯は、このタイムゾーンで判断します。業務の時刻も、この地域の時刻に直して届きます。</span></div>
     <div class="field"><span class="lbl">朝の通知の時刻</span><select name="time" id="n-time">${timeOpts(4, 12, 15, n.time)}</select></div>
     <div class="field"><span class="lbl">夜間は送らない</span><div class="nt-quiet"><select name="quietStart" id="n-qs" aria-label="夜間の開始">${timeOpts(19, 26, 30, n.quietStart)}</select><span>〜</span><select name="quietEnd" id="n-qe" aria-label="夜間の終わり">${timeOpts(4, 10, 30, n.quietEnd)}</select></div></div>
-    <div class="field full"><span class="lbl">日程調整で使うGoogleカレンダーのアドレス（任意）</span><input type="email" id="n-cal" value="${esc((S.member && S.member.calEmail) || "")}" placeholder="${esc((S.user && S.user.email) || "")}"><span class="help">空欄なら、ログインしているアドレスのカレンダーを使います。会社以外のカレンダーの場合は、そのカレンダーの設定で日程調整を作る人に「予定の表示（時間枠のみ）」を共有してください</span></div>
+    <div class="field full"><span class="lbl">日程調整で追加で読むカレンダー（任意）</span><input type="text" id="n-cal" inputmode="email" autocomplete="off" value="${esc((S.member && S.member.calEmail) || "")}" placeholder="例：yourname@gmail.com"><span class="help">ログインしているアドレス（${esc((S.user && S.user.email) || "")}）のカレンダーは、いつも読みます。個人のGoogleカレンダーなどにも予定を入れている人は、そのアドレスを入れてください（複数は「,」で区切る）。そのカレンダーの設定で、日程調整を作る人に「予定の表示（時間枠のみ）」を共有する必要があります。終日の予定と「空き時間」にした予定は、予定ありに数えません</span></div>
     <p class="muted full" style="grid-column:1/-1;margin:0;font-size:.78rem">夜間に追加された未対応事項は、夜間が明けてからまとめて届きます。実際に届くのは、設定した時刻から10分ほど遅れることがあります。</p>`;
   form.innerHTML = `<div class="dlg-h"><h3>通知</h3><button type="button" data-close aria-label="閉じる">×</button></div><div class="dlg-b">${body}<p class="err" id="f-err" hidden></p></div>
     <div class="dlg-f"><div class="sp"><button class="btn sec" type="button" data-close>閉じる</button><button class="btn" type="button" id="n-save">設定を保存</button></div></div>`;
@@ -1593,7 +1600,7 @@ async function saveNotify(quiet) {
   const data = g("#n-tz") ? { morning: g("#n-morning").checked, issues: g("#n-issues").checked, minutes: g("#n-minutes").checked, polls: g("#n-polls").checked, tz: g("#n-tz").value, time: g("#n-time").value, quietStart: g("#n-qs").value, quietEnd: g("#n-qe").value }
     : { morning: n.morning, issues: n.issues, minutes: n.minutes, polls: n.polls, tz: quiet ? browserTz() : n.tz, time: n.time, quietStart: n.quietStart, quietEnd: n.quietEnd };
   const ce = g("#n-cal") ? g("#n-cal").value.trim().toLowerCase() : null;
-  if (ce && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(ce)) throw new Error("カレンダーのアドレスの形が正しくありません。");
+  if (ce && ce.split(/[,、\s]+/).filter(Boolean).some(x => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(x))) throw new Error("カレンダーのアドレスの形が正しくありません（複数は「,」で区切ってください）。");
   await updateDoc(doc(db, "members", uid()), { notify: data, ...(ce !== null ? { calEmail: ce } : {}) });
 }
 
