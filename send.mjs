@@ -272,7 +272,8 @@ export async function stripeSync(db) {
   if (!sc.account || !sc.payoutAccount) return fail("ボードの収支画面で「Stripeの口座」と「入金先の口座」を選んでください");
   try {
     // 1) 取引 → 収支（同じ取引は2回記録しない：記録のIDを stripe_<取引ID> にする）
-    const since = st.cursor && st.mode === (test ? "test" : "live") ? st.cursor - 3600 : Math.floor(new Date((sc.since || localParts("Asia/Tokyo").date.slice(0, 8) + "01") + "T00:00:00+09:00").getTime() / 1000);
+    const sinceCfg = sc.since || ""; // 取り込み開始日を変えたら、その日から取り込み直す（同じ取引は2回記録しない）
+    const since = st.cursor && st.mode === (test ? "test" : "live") && (st.since || "") === sinceCfg ? st.cursor - 3600 : Math.floor(new Date((sc.since || localParts("Asia/Tokyo").date.slice(0, 8) + "01") + "T00:00:00+09:00").getTime() / 1000);
     const bts = await stripeAll("balance_transactions", { "created[gte]": since }, key);
     const recs = bts.flatMap(bt => btToRecords(bt, { account: sc.account, payoutAccount: sc.payoutAccount, test }));
     let added = 0;
@@ -300,7 +301,7 @@ export async function stripeSync(db) {
       if (!DRY && args.length) await d.ref.update(...args); kn++;
     }
     console.log(`Stripe（${test ? "テスト" : "本番"}）：取引${bts.length}件 → 収支に${added}件追加 / 契約${subs.length}件 → KPI ${kn}件を更新（MRR ${mtr.latest.stripe_mrr}・有料会員 ${mtr.latest.stripe_active}）`);
-    if (!DRY) await stateRef.set({ lastRun: new Date().toISOString(), lastError: "", lastAdded: added, cursor: maxCreated || since, mode: test ? "test" : "live", test, metrics: { at: today, ...mtr.latest } }, { merge: true });
+    if (!DRY) await stateRef.set({ lastRun: new Date().toISOString(), lastError: "", lastAdded: added, cursor: maxCreated || since, since: sinceCfg, mode: test ? "test" : "live", test, metrics: { at: today, ...mtr.latest } }, { merge: true });
   } catch (e) {
     await fail(e.status === 401 ? "STRIPE_KEY が正しくありません" : e.status === 403 ? "キーの権限が足りません（" + e.message + "）" : e.message);
   }
