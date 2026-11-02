@@ -6,7 +6,7 @@
 //  3. 議事録のまとめ：「まとめ待ち」の議事録があれば、Gemini で要約して書き戻し、追加した人に通知する
 //  4. 日程調整：始まったとき・締め切り前・決定したときに、参加者へ通知する
 //  5. Stripe 連携：取引を収支に（暗号化して）記録し、契約数・MRRをKPIに入れる（STRIPE_KEY があるときだけ）
-import { initializeApp, cert } from "firebase-admin/app";
+import { initializeApp, cert, applicationDefault } from "firebase-admin/app";
 import { getFirestore, FieldValue, FieldPath } from "firebase-admin/firestore";
 import { getMessaging } from "firebase-admin/messaging";
 
@@ -413,9 +413,13 @@ export function friendlyGeminiError(e) {
 
 async function main() {
   if (!process.env.SITE_URL) throw new Error("SITE_URL が設定されていません（notify.yml）");
-  const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || "{}");
-  if (!sa.project_id) throw new Error("FIREBASE_SERVICE_ACCOUNT が設定されていません");
-  initializeApp({ credential: cert(sa) });
+  // つなぎ方は2通り：
+  //  ・鍵なし（推奨）：notify.yml の google-github-actions/auth が、その場限りの権限を用意する
+  //  ・鍵あり：GitHub Secrets の FIREBASE_SERVICE_ACCOUNT（組織の設定で鍵を作れない場合は使えない）
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (raw && raw.trim().startsWith("{")) initializeApp({ credential: cert(JSON.parse(raw)) });
+  else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) initializeApp({ credential: applicationDefault(), projectId: process.env.GOOGLE_CLOUD_PROJECT || process.env.FIREBASE_PROJECT_ID || "shin-board" });
+  else throw new Error("Firebase につなぐ設定がありません（notify.yml の認証の手順か、FIREBASE_SERVICE_ACCOUNT を確認してください）");
   const db = getFirestore(), fcm = getMessaging();
   if (TEST) {
     const ms = await db.collection("members").where("email", "==", ADMIN_EMAIL).get();
