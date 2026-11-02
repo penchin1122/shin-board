@@ -44,7 +44,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm install --no-save --no-audit --no-fund firebase-admin@12
+      - run: npm install --no-save --no-audit --no-fund firebase-admin@13
       - run: node send.mjs
         env:
           FIREBASE_PROJECT_ID: shin-board
